@@ -240,16 +240,25 @@ stats_pool_init(struct stats_pool *stp, struct server_pool *sp)
     stp->name = sp->name;
     array_null(&stp->metric);
     array_null(&stp->server);
+    array_null(&stp->server_be);
 
     status = stats_pool_metric_init(&stp->metric);
     if (status != NC_OK) {
         return status;
     }
 
-    status = stats_server_map(&stp->server, &sp->server);
+    status = stats_server_map(&stp->server, &sp->frontends.server_arr);
     if (status != NC_OK) {
         stats_metric_deinit(&stp->metric);
         return status;
+    }
+
+    if (array_n(&sp->backends.server_arr) > 0) {
+        status = stats_server_map(&stp->server_be, &sp->backends.server_arr);
+        if (status != NC_OK) {
+            stats_metric_deinit(&stp->metric);
+            return status;
+        }
     }
 
     log_debug(LOG_VVVERB, "init stats pool '%.*s' with %"PRIu32" metric and "
@@ -401,6 +410,23 @@ stats_create_buf(struct stats *st)
                 size += key_value_extra;
             }
         }
+
+        /* backend servers per pool */
+        for (j = 0; j < array_n(&stp->server_be); j++) {
+            struct stats_server *sts = array_get(&stp->server_be, j);
+            uint32_t k;
+
+            size += sts->name.len;
+            size += server_extra;
+
+            for (k = 0; k < array_n(&sts->metric); k++) {
+                struct stats_metric *stm = array_get(&sts->metric, k);
+
+                size += stm->name.len;
+                size += int64_max_digits;
+                size += key_value_extra;
+            }
+        }
     }
 
     /* footer */
@@ -466,7 +492,7 @@ stats_add_num(struct stats *st, struct string *key, int64_t val)
     pos = buf->data + buf->len;
     room = buf->size - buf->len - 1;
 
-    n = nc_snprintf(pos, room, "\"%.*s\":%"PRId64", ", key->len, key->data,
+    n = nc_snprintf(pos, room, "\"%.*s\":%"PRIu64", ", key->len, key->data,
                     val);
     if (n < 0 || n >= (int)room) {
         return NC_ERROR;
@@ -516,7 +542,8 @@ stats_add_header(struct stats *st)
         return status;
     }
 
-    status = stats_add_num(st, &st->ntotal_conn_str, conn_ntotal_conn());
+    /* TODO: REVIEW conn_ntotal_conn() is uint64_t, but all other stats are int64_t */
+    status = stats_add_num(st, &st->ntotal_conn_str, (int64_t)conn_ntotal_conn());
     if (status != NC_OK) {
         return status;
     }
@@ -690,6 +717,14 @@ stats_aggregate(struct stats *st)
             sts2 = array_get(&stp2->server, j);
             stats_aggregate_metric(&sts2->metric, &sts1->metric);
         }
+
+        for (j = 0; j < array_n(&stp1->server_be); j++) {
+            struct stats_server *sts1, *sts2;
+
+            sts1 = array_get(&stp1->server_be, j);
+            sts2 = array_get(&stp2->server_be, j);
+            stats_aggregate_metric(&sts2->metric, &sts1->metric);
+        }
     }
 
     st->aggregate = 0;
@@ -723,6 +758,26 @@ stats_make_rsp(struct stats *st)
 
         for (j = 0; j < array_n(&stp->server); j++) {
             struct stats_server *sts = array_get(&stp->server, j);
+
+            status = stats_begin_nesting(st, &sts->name);
+            if (status != NC_OK) {
+                return status;
+            }
+
+            /* copy server metric from sum(c) to buffer */
+            status = stats_copy_metric(st, &sts->metric);
+            if (status != NC_OK) {
+                return status;
+            }
+
+            status = stats_end_nesting(st);
+            if (status != NC_OK) {
+                return status;
+            }
+        }
+
+        for (j = 0; j < array_n(&stp->server_be); j++) {
+            struct stats_server *sts = array_get(&stp->server_be, j);
 
             status = stats_begin_nesting(st, &sts->name);
             if (status != NC_OK) {
@@ -1125,7 +1180,7 @@ stats_server_to_metric(struct context *ctx, struct server *server,
 
     st = ctx->stats;
     stp = array_get(&st->current, pidx);
-    sts = array_get(&stp->server, sidx);
+    sts = server->backend ? array_get(&stp->server_be, sidx) : array_get(&stp->server, sidx);
     stm = array_get(&sts->metric, fidx);
 
     st->updated = 1;

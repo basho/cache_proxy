@@ -22,7 +22,9 @@
 
 typedef rstatus_t (*conn_recv_t)(struct context *, struct conn*);
 typedef struct msg* (*conn_recv_next_t)(struct context *, struct conn *, bool);
-typedef void (*conn_recv_done_t)(struct context *, struct conn *, struct msg *, struct msg *);
+typedef void (*conn_recv_done_t)(struct context *, struct conn *, struct msg *, struct msg *, bool backend, bool enqueue);
+
+typedef rstatus_t (*conn_req_remap_t)(struct conn* conn, struct msg* msg);
 
 typedef rstatus_t (*conn_send_t)(struct context *, struct conn*);
 typedef struct msg* (*conn_send_next_t)(struct context *, struct conn *);
@@ -52,9 +54,12 @@ struct conn {
     struct msg          *rmsg;         /* current message being rcvd */
     struct msg          *smsg;         /* current message being sent */
 
+    STAILQ_ENTRY(conn)  resend_stqe;   /* link in msg's resend q */
+
     conn_recv_t         recv;          /* recv (read) handler */
     conn_recv_next_t    recv_next;     /* recv next message handler */
     conn_recv_done_t    recv_done;     /* read done handler */
+    conn_req_remap_t    req_remap;     /* read done handler */
     conn_send_t         send;          /* send (write) handler */
     conn_send_next_t    send_next;     /* write next message handler */
     conn_send_done_t    send_done;     /* write done handler */
@@ -63,6 +68,7 @@ struct conn {
     conn_post_connect_t post_connect;  /* post connect handler */
     conn_swallow_msg_t  swallow_msg;   /* react on messages to be swallowed */
 
+    connection_type_t   type;          /* The type of connection */
     conn_ref_t          ref;           /* connection reference handler */
     conn_unref_t        unref;         /* connection unreference handler */
 
@@ -87,14 +93,11 @@ struct conn {
     unsigned            connected:1;   /* connected? */
     unsigned            eof:1;         /* eof? aka passive close? */
     unsigned            done:1;        /* done? aka close? */
-    unsigned            redis:1;       /* redis? */
     unsigned            need_auth:1;   /* need_auth? */
 };
 
-TAILQ_HEAD(conn_tqh, conn);
-
 struct context *conn_to_ctx(struct conn *conn);
-struct conn *conn_get(void *owner, bool client, bool redis);
+struct conn *conn_get(void *owner, bool client, connection_type_t type);
 struct conn *conn_get_proxy(void *owner);
 void conn_put(struct conn *conn);
 ssize_t conn_recv(struct conn *conn, void *buf, size_t size);
@@ -104,5 +107,7 @@ void conn_deinit(void);
 uint32_t conn_ncurr_conn(void);
 uint64_t conn_ntotal_conn(void);
 uint32_t conn_ncurr_cconn(void);
+
+uint32_t conn_nbackend(struct conn* conn);
 
 #endif

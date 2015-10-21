@@ -154,4 +154,20 @@ void core_stop(struct context *ctx);
 rstatus_t core_core(void *arg, uint32_t events);
 rstatus_t core_loop(struct context *ctx);
 
+void _core_log_msg_queues(struct context* ctx);
+void _core_log_msg_queues_pool(struct server_pool *pool);
+void _core_log_msg_queues_server_arr(char* pool_type, struct array *server_arr);
+void _core_log_msg_queues_server(struct server* server);
+void _core_log_msg_queues_client(struct server_pool* pool);
+void _core_log_msg_queues_connection(struct conn* connection);
+void _core_log_msg_queues_msg(struct msg* msg);
+
+#ifdef NC_DEBUG_LOG
+#define core_log_msg_queues(ctx) do {                                          \
+        _core_log_msg_queues(ctx);                                             \
+} while (0)
+#else
+#define core_log_msg_queues(ctx)
+#endif
+
 #endif

@@ -182,8 +182,16 @@ server_conn(struct server *server)
      * 'server_connections:' > 0 key
      */
 
+    connection_type_t type;
+
+    if (server->backend) {
+        type = pool->backend_opt.type;
+    } else {
+        type = (pool->redis ? CONN_REDIS : CONN_MEMCACHE);
+    }
+
     if (server->ns_conn_q < pool->server_connections) {
-        return conn_get(server, false, pool->redis);
+        return conn_get(server, false, type);
     }
     ASSERT(server->ns_conn_q == pool->server_connections);
 
@@ -287,7 +295,12 @@ server_failure(struct context *ctx, struct server *server)
     server->failure_count = 0;
     server->next_retry = next;
 
-    status = server_pool_run(pool);
+    status = servers_run(&pool->frontends);
+    if (status != NC_OK) {
+        log_error("updating pool %"PRIu32" '%.*s' failed: %s", pool->idx,
+                  pool->name.len, pool->name.data, strerror(errno));
+    }
+    status = servers_run(&pool->backends);
     if (status != NC_OK) {
         log_error("updating pool %"PRIu32" '%.*s' failed: %s", pool->idx,
                   pool->name.len, pool->name.data, strerror(errno));
@@ -462,7 +475,7 @@ server_connect(struct context *ctx, struct server *server, struct conn *conn)
     log_debug(LOG_VVERB, "connect to server '%.*s'", server->pname.len,
               server->pname.data);
 
-    conn->sd = socket(conn->family, SOCK_STREAM, 0);
+    conn->sd = socket(conn->family, SOCK_STREAM, conn->type == CONN_RIAK ? 6 : 0);
     if (conn->sd < 0) {
         log_error("socket for server '%.*s' failed: %s", server->pname.len,
                   server->pname.data, strerror(errno));
@@ -561,17 +574,17 @@ server_ok(struct context *ctx, struct conn *conn)
 }
 
 static rstatus_t
-server_pool_update(struct server_pool *pool)
+servers_update(struct servers *servers)
 {
     rstatus_t status;
     int64_t now;
     uint32_t pnlive_server; /* prev # live server */
 
-    if (!pool->auto_eject_hosts) {
+    if (!servers->owner->auto_eject_hosts) {
         return NC_OK;
     }
 
-    if (pool->next_rebuild == 0LL) {
+    if (servers->next_rebuild == 0LL) {
         return NC_OK;
     }
 
@@ -580,38 +593,40 @@ server_pool_update(struct server_pool *pool)
         return NC_ERROR;
     }
 
-    if (now <= pool->next_rebuild) {
-        if (pool->nlive_server == 0) {
+    if (now <= servers->next_rebuild) {
+        if (servers->nlive_server == 0) {
             errno = ECONNREFUSED;
             return NC_ERROR;
         }
         return NC_OK;
     }
 
-    pnlive_server = pool->nlive_server;
+    pnlive_server = servers->nlive_server;
 
-    status = server_pool_run(pool);
+    status = servers_run(servers);
     if (status != NC_OK) {
-        log_error("updating pool %"PRIu32" with dist %d failed: %s", pool->idx,
-                  pool->dist_type, strerror(errno));
+        log_error("updating pool %"PRIu32" with dist %d failed: %s",
+                  servers->owner->idx, servers->owner->dist_type,
+                  strerror(errno));
         return status;
     }
 
     log_debug(LOG_INFO, "update pool %"PRIu32" '%.*s' to add %"PRIu32" servers",
-              pool->idx, pool->name.len, pool->name.data,
-              pool->nlive_server - pnlive_server);
+              servers->owner->idx, servers->owner->name.len,
+              servers->owner->name.data, servers->nlive_server - pnlive_server);
 
 
     return NC_OK;
 }
 
 static uint32_t
-server_pool_hash(struct server_pool *pool, uint8_t *key, uint32_t keylen)
+servers_hash(struct servers *servers, uint8_t *key,
+                 uint32_t keylen)
 {
-    ASSERT(array_n(&pool->server) != 0);
+    ASSERT(array_n(&servers->server_arr) != 0);
     ASSERT(key != NULL);
 
-    if (array_n(&pool->server) == 1) {
+    if (array_n(&servers->server_arr) == 1) {
         return 0;
     }
 
@@ -619,15 +634,15 @@ server_pool_hash(struct server_pool *pool, uint8_t *key, uint32_t keylen)
         return 0;
     }
 
-    return pool->key_hash((char *)key, keylen);
+    return servers->owner->key_hash((char *)key, keylen);
 }
 
 uint32_t
-server_pool_idx(struct server_pool *pool, uint8_t *key, uint32_t keylen)
+servers_idx(struct servers *servers, uint8_t *key, uint32_t keylen)
 {
     uint32_t hash, idx;
 
-    ASSERT(array_n(&pool->server) != 0);
+    ASSERT(array_n(&servers->server_arr) != 0);
     ASSERT(key != NULL);
 
     /*
@@ -635,8 +650,8 @@ server_pool_idx(struct server_pool *pool, uint8_t *key, uint32_t keylen)
      * the key within the hash tag as an input to the distributor. Otherwise
      * we use the full key
      */
-    if (!string_empty(&pool->hash_tag)) {
-        struct string *tag = &pool->hash_tag;
+    if (!string_empty(&servers->owner->hash_tag)) {
+        struct string *tag = &servers->owner->hash_tag;
         uint8_t *tag_start, *tag_end;
 
         tag_start = nc_strchr(key, key + keylen, tag->data[0]);
@@ -649,76 +664,112 @@ server_pool_idx(struct server_pool *pool, uint8_t *key, uint32_t keylen)
         }
     }
 
-    switch (pool->dist_type) {
+    switch (servers->owner->dist_type) {
     case DIST_KETAMA:
-        hash = server_pool_hash(pool, key, keylen);
-        idx = ketama_dispatch(pool->continuum, pool->ncontinuum, hash);
+        hash = servers_hash(servers, key, keylen);
+        idx = ketama_dispatch(servers->continuum, servers->ncontinuum, hash);
         break;
 
     case DIST_MODULA:
-        hash = server_pool_hash(pool, key, keylen);
-        idx = modula_dispatch(pool->continuum, pool->ncontinuum, hash);
+        hash = servers_hash(servers, key, keylen);
+        idx = modula_dispatch(servers->continuum, servers->ncontinuum, hash);
         break;
 
     case DIST_RANDOM:
-        idx = random_dispatch(pool->continuum, pool->ncontinuum, 0);
+        idx = random_dispatch(servers->continuum, servers->ncontinuum, 0);
         break;
 
     default:
         NOT_REACHED();
         return 0;
     }
-    ASSERT(idx < array_n(&pool->server));
+    ASSERT(idx < array_n(&servers->server_arr));
     return idx;
 }
 
-static struct server *
-server_pool_server(struct server_pool *pool, uint8_t *key, uint32_t keylen)
+struct server *
+servers_server(struct servers *servers, uint8_t *key, uint32_t keylen)
 {
     struct server *server;
     uint32_t idx;
 
-    idx = server_pool_idx(pool, key, keylen);
-    server = array_get(&pool->server, idx);
+    idx = servers_idx(servers, key, keylen);
+    server = array_get(&servers->server_arr, idx);
 
     log_debug(LOG_VERB, "key '%.*s' on dist %d maps to server '%.*s'", keylen,
-              key, pool->dist_type, server->pname.len, server->pname.data);
+              key, servers->owner->dist_type, server->pname.len, server->pname.data);
 
     return server;
 }
 
-struct conn *
-server_pool_conn(struct context *ctx, struct server_pool *pool, uint8_t *key,
-                 uint32_t keylen)
+static struct conn *
+servers_conn(struct context *ctx, struct servers *servers, uint8_t *key,
+             uint32_t keylen, struct server* input_server)
 {
     rstatus_t status;
     struct server *server;
     struct conn *conn;
 
-    status = server_pool_update(pool);
+    ASSERT(servers != NULL);
+
+    status = servers_update(servers);
     if (status != NC_OK) {
+        log_debug(LOG_VVERB, "error getting connection from pool %d "
+                             "(updating the pool failed)",
+                             servers->owner->idx);
         return NULL;
     }
 
-    /* from a given {key, keylen} pick a server from pool */
-    server = server_pool_server(pool, key, keylen);
+    if (input_server != NULL) {
+        server = input_server;
+    } else {
+        server = servers_server(servers, key, keylen);
+    }
+
     if (server == NULL) {
+        log_debug(LOG_VVERB, "error getting connection from pool %d "
+                             "(selecting server via hash failed)",
+                             servers->owner->idx);
         return NULL;
     }
 
     /* pick a connection to a given server */
     conn = server_conn(server);
     if (conn == NULL) {
+        log_debug(LOG_VVERB, "error getting connection from pool %d "
+                             "(selecting a connection to the server failed)",
+                             servers->owner->idx);
         return NULL;
     }
 
     status = server_connect(ctx, server, conn);
     if (status != NC_OK) {
+        log_debug(LOG_VVERB, "error getting connection from pool %d "
+                             "(using the selected connection failed)",
+                             servers->owner->idx);
         server_close(ctx, conn);
         return NULL;
     }
 
     return conn;
+}
+
+struct conn *
+server_pool_conn_frontend(struct context *ctx, struct server_pool *pool,
+                          uint8_t *key, uint32_t keylen,
+                          struct server* input_server)
+{
+    ASSERT(pool != NULL);
+    return servers_conn(ctx, &pool->frontends, key, keylen, input_server);
+}
+
+struct conn *
+server_pool_conn_backend(struct context *ctx, struct server_pool *pool,
+                         uint8_t *key, uint32_t keylen,
+                         struct server* input_server)
+{
+    ASSERT(pool != NULL);
+    return servers_conn(ctx, &pool->frontends, key, keylen, input_server);
 }
 
 static rstatus_t
@@ -731,7 +782,14 @@ server_pool_each_preconnect(void *elem, void *data)
         return NC_OK;
     }
 
-    status = array_each(&sp->server, server_each_preconnect, NULL);
+    status = array_each(&sp->frontends.server_arr, server_each_preconnect,
+                        NULL);
+    if (status != NC_OK) {
+        return status;
+    }
+
+    status = array_each(&sp->backends.server_arr, server_each_preconnect,
+                        NULL);
     if (status != NC_OK) {
         return status;
     }
@@ -758,7 +816,14 @@ server_pool_each_disconnect(void *elem, void *data)
     rstatus_t status;
     struct server_pool *sp = elem;
 
-    status = array_each(&sp->server, server_each_disconnect, NULL);
+    status = array_each(&sp->frontends.server_arr, server_each_disconnect,
+                        NULL);
+    if (status != NC_OK) {
+        return status;
+    }
+
+    status = array_each(&sp->backends.server_arr, server_each_disconnect,
+                        NULL);
     if (status != NC_OK) {
         return status;
     }
@@ -789,26 +854,34 @@ server_pool_each_calc_connections(void *elem, void *data)
     struct server_pool *sp = elem;
     struct context *ctx = data;
 
-    ctx->max_nsconn += sp->server_connections * array_n(&sp->server);
+    ctx->max_nsconn += sp->server_connections
+            * array_n(&sp->frontends.server_arr);
+    ctx->max_nsconn += sp->server_connections
+            * array_n(&sp->backends.server_arr);
     ctx->max_nsconn += 1; /* pool listening socket */
 
     return NC_OK;
 }
 
 rstatus_t
-server_pool_run(struct server_pool *pool)
+servers_run(struct servers *servers)
 {
-    ASSERT(array_n(&pool->server) != 0);
+    if (&servers->owner->backends == servers && array_n(&servers->server_arr)
+            == 0) {
+        return NC_OK;
+    }
 
-    switch (pool->dist_type) {
+    ASSERT(array_n(&servers->server_arr) != 0);
+
+    switch (servers->owner->dist_type) {
     case DIST_KETAMA:
-        return ketama_update(pool);
+        return ketama_update(servers);
 
     case DIST_MODULA:
-        return modula_update(pool);
+        return modula_update(servers);
 
     case DIST_RANDOM:
-        return random_update(pool);
+        return random_update(servers);
 
     default:
         NOT_REACHED();
@@ -821,7 +894,15 @@ server_pool_run(struct server_pool *pool)
 static rstatus_t
 server_pool_each_run(void *elem, void *data)
 {
-    return server_pool_run(elem);
+    rstatus_t ret;
+    struct server_pool *pool = (struct server_pool *)elem;
+    ret = servers_run(&pool->frontends);
+    if (ret != NC_OK) {
+        return ret;
+    }
+
+    ret = servers_run(&pool->backends);
+    return ret;
 }
 
 rstatus_t
@@ -875,6 +956,19 @@ server_pool_init(struct array *server_pool, struct array *conf_pool,
     return NC_OK;
 }
 
+static void
+servers_deinit(struct servers *servers)
+{
+    if (servers->continuum != NULL) {
+        nc_free(servers->continuum);
+        servers->ncontinuum = 0;
+        servers->nserver_continuum = 0;
+        servers->nlive_server = 0;
+    }
+
+    server_deinit(&servers->server_arr);
+}
+
 void
 server_pool_deinit(struct array *server_pool)
 {
@@ -887,14 +981,8 @@ server_pool_deinit(struct array *server_pool)
         ASSERT(sp->p_conn == NULL);
         ASSERT(TAILQ_EMPTY(&sp->c_conn_q) && sp->nc_conn_q == 0);
 
-        if (sp->continuum != NULL) {
-            nc_free(sp->continuum);
-            sp->ncontinuum = 0;
-            sp->nserver_continuum = 0;
-            sp->nlive_server = 0;
-        }
-
-        server_deinit(&sp->server);
+        servers_deinit(&sp->frontends);
+        servers_deinit(&sp->backends);
 
         log_debug(LOG_DEBUG, "deinit pool %"PRIu32" '%.*s'", sp->idx,
                   sp->name.len, sp->name.data);

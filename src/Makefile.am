@@ -9,7 +9,7 @@ AM_CPPFLAGS += -I $(top_srcdir)/src/proto
 AM_CPPFLAGS += -I $(top_srcdir)/src/event
 AM_CPPFLAGS += -I $(top_srcdir)/contrib/yaml-0.1.4/include
 
-AM_CFLAGS = 
+AM_CFLAGS = $(PROTOBUF_CFLAGS)
 # about -fno-strict-aliasing: https://github.com/twitter/twemproxy/issues/276
 AM_CFLAGS += -fno-strict-aliasing
 AM_CFLAGS += -Wall -Wshadow
@@ -40,6 +40,7 @@ nutcracker_SOURCES =			\
 	nc_server.c nc_server.h		\
 	nc_proxy.c nc_proxy.h		\
 	nc_message.c nc_message.h	\
+	nc_backend.c nc_backend.h	\
 	nc_request.c			\
 	nc_response.c			\
 	nc_mbuf.c nc_mbuf.h		\
@@ -54,7 +55,8 @@ nutcracker_SOURCES =			\
 	nc_queue.h			\
 	nc.c
 
-nutcracker_LDADD = $(top_builddir)/src/hashkit/libhashkit.a
+nutcracker_LDADD =  $(top_builddir)/src/hashkit/libhashkit.a
 nutcracker_LDADD += $(top_builddir)/src/proto/libproto.a
 nutcracker_LDADD += $(top_builddir)/src/event/libevent.a
 nutcracker_LDADD += $(top_builddir)/contrib/yaml-0.1.4/src/.libs/libyaml.a
+nutcracker_LDADD += $(PROTOBUF_LIBS)

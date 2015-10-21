@@ -238,11 +238,11 @@ _safe_vsnprintf(char *to, size_t size, const char *format, va_list ap)
                     char buff[22];
                     const int base = (*format == 'x' || *format == 'p') ? 16 : 10;
 
-		            /* *INDENT-OFF* */
+                    /* *INDENT-OFF* */
                     char *val_as_str = (*format == 'u') ?
                         _safe_utoa(base, uval, &buff[sizeof(buff) - 1]) :
                         _safe_itoa(base, ival, &buff[sizeof(buff) - 1]);
-		            /* *INDENT-ON* */
+                    /* *INDENT-ON* */
 
                     /* Strip off "ffffffff" if we have 'x' format without 'll' */
                     if (*format == 'x' && !have_longlong && ival < 0) {

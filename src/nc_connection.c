@@ -22,6 +22,7 @@
 #include <nc_client.h>
 #include <nc_proxy.h>
 #include <proto/nc_proto.h>
+#include <signal.h>
 
 /*
  *                   nc_connection.[ch]
@@ -155,8 +156,8 @@ _conn_get(void)
     conn->connected = 0;
     conn->eof = 0;
     conn->done = 0;
-    conn->redis = 0;
     conn->need_auth = 0;
+    conn->type = CONN_UNKNOWN;
 
     ntotal_conn++;
     ncurr_conn++;
@@ -165,10 +166,11 @@ _conn_get(void)
 }
 
 static bool
-conn_need_auth(void *owner, bool redis) {
+conn_need_auth(void *owner, connection_type_t type)
+{
     struct server_pool *pool = (struct server_pool *)(owner);
 
-    if (redis && pool->redis_auth.len > 0) {
+    if (type == CONN_REDIS && pool->redis_auth.len > 0) {
         return true;
     }
 
@@ -176,7 +178,7 @@ conn_need_auth(void *owner, bool redis) {
 }
 
 struct conn *
-conn_get(void *owner, bool client, bool redis)
+conn_get(void *owner, bool client, connection_type_t type)
 {
     struct conn *conn;
 
@@ -185,10 +187,10 @@ conn_get(void *owner, bool client, bool redis)
         return NULL;
     }
 
-    /* connection either handles redis or memcache messages */
-    conn->redis = redis ? 1 : 0;
+    /* connection handles redis, riak, or memcache messages */
 
     conn->client = client ? 1 : 0;
+    conn->type = type;
 
     if (conn->client) {
         /*
@@ -208,7 +210,7 @@ conn_get(void *owner, bool client, bool redis)
 
         conn->ref = client_ref;
         conn->unref = client_unref;
-        conn->need_auth = conn_need_auth(owner, redis);
+        conn->need_auth = conn_need_auth(owner, conn->type);
 
         conn->enqueue_inq = NULL;
         conn->dequeue_inq = NULL;
@@ -226,7 +228,15 @@ conn_get(void *owner, bool client, bool redis)
         struct server *server = (struct server *)owner;
 
         conn->recv = msg_recv;
-        conn->recv_next = rsp_recv_next;
+
+        if (conn->type == CONN_RIAK) {
+            conn->recv_next = riak_rsp_recv_next;
+            conn->req_remap = riak_req_remap;
+        } else {
+            conn->recv_next = rsp_recv_next;
+            conn->req_remap = req_remap;
+        }
+
         conn->recv_done = rsp_recv_done;
 
         conn->send = msg_send;
@@ -239,18 +249,22 @@ conn_get(void *owner, bool client, bool redis)
         conn->ref = server_ref;
         conn->unref = server_unref;
 
-        conn->need_auth = conn_need_auth(server->owner, redis);
+        conn->need_auth    = conn_need_auth(server->owner, conn->type);
 
         conn->enqueue_inq = req_server_enqueue_imsgq;
         conn->dequeue_inq = req_server_dequeue_imsgq;
         conn->enqueue_outq = req_server_enqueue_omsgq;
         conn->dequeue_outq = req_server_dequeue_omsgq;
-        if (redis) {
-          conn->post_connect = redis_post_connect;
-          conn->swallow_msg = redis_swallow_msg;
+
+        if (type == CONN_REDIS) {
+            conn->post_connect = redis_post_connect;
+            conn->swallow_msg = redis_swallow_msg;
+        } else if (type == CONN_RIAK) {
+            conn->post_connect = riak_post_connect;
+            conn->swallow_msg = riak_swallow_msg;
         } else {
-          conn->post_connect = memcache_post_connect;
-          conn->swallow_msg = memcache_swallow_msg;
+            conn->post_connect = memcache_post_connect;
+            conn->swallow_msg = memcache_swallow_msg;
         }
     }
 
@@ -263,15 +277,14 @@ conn_get(void *owner, bool client, bool redis)
 struct conn *
 conn_get_proxy(void *owner)
 {
-    struct server_pool *pool = owner;
-    struct conn *conn;
+    struct conn* conn = 0;
 
     conn = _conn_get();
     if (conn == NULL) {
         return NULL;
     }
 
-    conn->redis = pool->redis;
+    conn->type = CONN_REDIS;
 
     conn->proxy = 1;
 
@@ -359,7 +372,7 @@ conn_recv(struct conn *conn, void *buf, size_t size)
     for (;;) {
         n = nc_read(conn->sd, buf, size);
 
-        log_debug(LOG_VERB, "recv on sd %d %zd of %zu", conn->sd, n, size);
+        log_hexdump(LOG_DEBUG, buf, n, "recv on sd %d %zd of %zu", conn->sd, n, size);
 
         if (n > 0) {
             if (n < (ssize_t) size) {
@@ -409,8 +422,12 @@ conn_sendv(struct conn *conn, struct array *sendv, size_t nsend)
     for (;;) {
         n = nc_writev(conn->sd, sendv->elem, sendv->nelem);
 
-        log_debug(LOG_VERB, "sendv on sd %d %zd of %zu in %"PRIu32" buffers",
-                  conn->sd, n, nsend, sendv->nelem);
+        uint32_t i = 0;
+        for (i = 0; i < sendv->nelem; i++) {
+          const struct iovec *ciov = (struct iovec *)array_get(sendv, i);
+          log_hexdump(LOG_DEBUG, ciov->iov_base, ciov->iov_len, "sendv on sd %d %zd/%zd of %zu in %"PRIu32" buffers",
+              conn->sd, ciov->iov_len,n, nsend, sendv->nelem);
+        }
 
         if (n > 0) {
             if (n < (ssize_t) nsend) {

@@ -17,7 +17,7 @@
 
 #include <stdio.h>
 #include <ctype.h>
-#include <math.h>
+#include <stdlib.h>
 
 #include <nc_core.h>
 #include <nc_proto.h>
@@ -964,6 +964,7 @@ redis_parse_req(struct msg *r)
                     r->type = MSG_REQ_REDIS_SDIFFSTORE;
                     break;
                 }
+                /* no break */
 
             case 11:
                 if (str11icmp(m, 'i', 'n', 'c', 'r', 'b', 'y', 'f', 'l', 'o', 'a', 't')) {
@@ -2382,7 +2383,7 @@ redis_fragment_argx(struct msg *r, uint32_t ncontinuum, struct msg_tqh *frag_msg
         uint32_t idx = msg_backend_idx(r, kpos->start, kpos->end - kpos->start);
 
         if (sub_msgs[idx] == NULL) {
-            sub_msgs[idx] = msg_get(r->owner, r->request, r->redis);
+            sub_msgs[idx] = msg_get(r->owner, r->request);
             if (sub_msgs[idx] == NULL) {
                 nc_free(sub_msgs);
                 return NC_ENOMEM;
@@ -2611,7 +2612,7 @@ redis_handle_auth_req(struct msg *request, struct msg *response)
     struct server_pool *pool;
     struct conn *conn = (struct conn *)response->owner;
 
-    ASSERT(conn->client && !conn->proxy && conn->redis);
+    ASSERT(conn->client && !conn->proxy && conn->type == CONN_REDIS);
 
     pool = (struct server_pool *)conn->owner;
 
@@ -2628,6 +2629,7 @@ redis_handle_auth_req(struct msg *request, struct msg *response)
     }
 
     NOT_REACHED();
+    return NC_ERROR;
 }
 
 rstatus_t
@@ -2642,7 +2644,7 @@ redis_add_auth_packet(struct context *ctx, struct conn *c_conn, struct conn *s_c
 
     pool = c_conn->owner;
 
-    msg = msg_get(c_conn, true, c_conn->redis);
+    msg = msg_get(c_conn, true);
     if (msg == NULL) {
         c_conn->err = errno;
         return NC_ENOMEM;
@@ -2671,7 +2673,7 @@ redis_post_connect(struct context *ctx, struct conn *conn, struct server *server
     int digits;
 
     ASSERT(!conn->client && conn->connected);
-    ASSERT(conn->redis);
+    ASSERT(conn->type == CONN_REDIS);
 
     /*
      * By default, every connection to redis uses the database DB 0. You
@@ -2688,12 +2690,12 @@ redis_post_connect(struct context *ctx, struct conn *conn, struct server *server
      * message to be head of queue as it might already contain a command
      * that triggered the connect.
      */
-    msg = msg_get(conn, true, conn->redis);
+    msg = msg_get(conn, true);
     if (msg == NULL) {
         return;
     }
 
-    digits = (pool->redis_db >= 10) ? (int)log10(pool->redis_db) + 1 : 1;
+    digits = ndig(pool->redis_db);
     status = msg_prepend_format(msg, "*2\r\n$6\r\nSELECT\r\n$%d\r\n%d\r\n", digits, pool->redis_db);
     if (status != NC_OK) {
         msg_put(msg);
@@ -2739,4 +2741,115 @@ redis_swallow_msg(struct conn *conn, struct msg *pmsg, struct msg *msg)
                  conn_pool->redis_db, conn_pool->name.data,
                  conn_server->name.data, message);
     }
+}
+
+/**.......................................................................
+ * Add a SET message to a server's queue, parsing the key name and
+ * value from a REDIS request/response pair
+ */
+rstatus_t
+add_set_msg_redis(struct context *ctx, struct conn* c_conn, struct msg* msg)
+{
+    ASSERT(msg != NULL);
+    ASSERT(msg->type == MSG_RSP_REDIS_BULK);
+    ASSERT(msg->peer != NULL);
+    ASSERT(msg->peer->type == MSG_REQ_REDIS_GET);
+
+    struct msg_pos keyname_start_pos = msg_pos_init();
+    size_t keynamelen=0;
+
+    rstatus_t status = NC_OK;
+    if ((status = redis_get_next_string(msg->peer, NULL, &keyname_start_pos, &keynamelen)) != NC_OK)
+        return status;
+
+    if ((status = redis_get_next_string(msg->peer, &keyname_start_pos, &keyname_start_pos, &keynamelen)) != NC_OK)
+        return status;
+
+    char keyname[keynamelen + 1];
+
+    if ((status = msg_extract_from_pos_char(keyname, &keyname_start_pos, keynamelen)) != NC_OK)
+        return status;
+
+    keyname[keynamelen] = '\0';
+
+    struct msg_pos keyval_start_pos = msg_pos_init();
+    size_t keyvallen=0;
+
+    if ((status = redis_get_next_string(msg, NULL, &keyval_start_pos, &keyvallen)) != NC_OK)
+        return status;
+
+    return add_set_msg_key(ctx, c_conn, keyname, &keyval_start_pos, keyvallen);
+}
+
+/**.......................................................................
+ * Get the starting position and length of the next Redis-formatted string in this message
+ */
+rstatus_t
+redis_get_next_string(struct msg* msg, struct msg_pos* init_pos, struct msg_pos* start_pos, size_t* len)
+{
+    rstatus_t status = NC_OK;
+
+    struct msg_pos strlen_start_pos = msg_pos_init();
+    struct msg_pos strlen_end_pos   = msg_pos_init();
+
+    /*
+    * Redis strings are formatted $n\r\nstringval...
+    *
+    * First find the start of the $ string length, and offset by 1 to
+    * get to the start of the number.
+    *
+    * If init_pos is a valid pos on entry to this function, use it as
+    * the starting position from which to search
+    */
+
+    msg_find_char(msg, "$",    1, init_pos,              &strlen_start_pos);
+
+    if (strlen_start_pos.result == MSG_NOTFOUND)
+        return NC_ERROR;
+
+    msg_offset_from(&strlen_start_pos, 1, &strlen_start_pos);
+
+    if (strlen_start_pos.result == MSG_NOTFOUND)
+        return NC_ERROR;
+
+    msg_find_char(msg, "\r\n", 2, &strlen_start_pos, &strlen_end_pos);
+
+    if (strlen_end_pos.result == MSG_NOTFOUND)
+        return NC_ERROR;
+
+    uint32_t fmtlen;
+    if ((status = msg_offset_between(&strlen_start_pos, &strlen_end_pos, &fmtlen)) != NC_OK)
+        return status;
+
+    char strnum[fmtlen+1];
+    if ((status = msg_extract_between_pos_char(strnum, &strlen_start_pos, &strlen_end_pos)) != NC_OK)
+        return status;
+
+    char* end_ptr=0;
+    strnum[fmtlen] = '\0';
+    *len = (uint32_t)strtol(strnum, &end_ptr, 10);
+
+    if (*end_ptr != '\0')
+        return NC_ERROR;
+
+    msg_find_char(msg, "\r\n", 2, &strlen_start_pos, start_pos);
+
+    if (start_pos->result == MSG_NOTFOUND)
+        return NC_ERROR;
+
+    msg_offset_from(start_pos, 2, start_pos);
+
+    if (start_pos->result == MSG_NOTFOUND)
+        return NC_ERROR;
+
+    return NC_OK;
+}
+
+/**.......................................................................
+ * Repack a message -- this is a no-op for Redis messages
+ */
+rstatus_t
+redis_repack(struct msg* r)
+{
+    return NC_OK;
 }

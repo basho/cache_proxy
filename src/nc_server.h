@@ -83,6 +83,33 @@ struct server {
 
     int64_t            next_retry;    /* next retry time in usec */
     uint32_t           failure_count; /* # consecutive failures */
+
+    bool               backend;       /* is a backend or frontend server? */
+};
+
+struct servers {
+    struct server_pool *owner;               /* owner pool */
+    struct array       server_arr;               /* server[] */
+    uint32_t           ncontinuum;           /* # continuum points */
+    uint32_t           nserver_continuum;    /* # servers - live and dead on continuum (const) */
+    struct continuum   *continuum;           /* continuum */
+    uint32_t           nlive_server;         /* # live server */
+    int64_t            next_rebuild;         /* next distribution rebuild time in usec */
+};
+
+struct backend_opt {
+    connection_type_t  type;                 /* The type of backend server */
+    int                max_resend;           /* maximum number of backend servers we will resend to */
+    int                riak_r;               /* Riak r val */
+    int                riak_pr;              /* Riak pr val */
+    int                riak_w;               /* Riak w val */
+    int                riak_pw;              /* Riak pw val */
+    int                riak_n;               /* Riak n val */
+    int                riak_basic_quorum;    /* Riak basic_quorum val */
+    int                riak_sloppy_quorum;   /* Riak sloppy_quorum val */
+    int                riak_notfound_ok;     /* Riak notfound_ok */
+    int                riak_deletedvclock;   /* Riak deletedvclock */
+    int                riak_timeout;         /* Riak timeout */
 };
 
 struct server_pool {
@@ -93,12 +120,13 @@ struct server_pool {
     uint32_t           nc_conn_q;            /* # client connection */
     struct conn_tqh    c_conn_q;             /* client connection q */
 
-    struct array       server;               /* server[] */
-    uint32_t           ncontinuum;           /* # continuum points */
-    uint32_t           nserver_continuum;    /* # servers - live and dead on continuum (const) */
-    struct continuum   *continuum;           /* continuum */
-    uint32_t           nlive_server;         /* # live server */
-    int64_t            next_rebuild;         /* next distribution rebuild time in usec */
+    struct servers     frontends;           /* frontend servers list */
+
+    /*  "Backends" are source-of-truth servers for which redis is used as a
+     *  read-through cache. They are managed by the same system as redis servers
+     *  and queries against them are handled in the same fashion. */
+    struct servers     backends;            /* backend servers list */
+    struct backend_opt backend_opt;         /* backend servers options */
 
     struct string      name;                 /* pool name (ref in conf_pool) */
     struct string      addrstr;              /* pool address (ref in conf_pool) */
@@ -119,6 +147,11 @@ struct server_pool {
     uint32_t           server_connections;   /* maximum # server connection */
     int64_t            server_retry_timeout; /* server retry timeout in usec */
     uint32_t           server_failure_limit; /* server failure limit */
+    int64_t            server_ttl_ms;        /* TTL for writes to the
+                                              * frontend servers in ms
+                                              * server_ttl_ms == 0
+                                              * will be taken to mean
+                                              * never */
     unsigned           auto_eject_hosts:1;   /* auto_eject_hosts? */
     unsigned           preconnect:1;         /* preconnect? */
     unsigned           redis:1;              /* redis? */
@@ -136,9 +169,14 @@ void server_close(struct context *ctx, struct conn *conn);
 void server_connected(struct context *ctx, struct conn *conn);
 void server_ok(struct context *ctx, struct conn *conn);
 
-uint32_t server_pool_idx(struct server_pool *pool, uint8_t *key, uint32_t keylen);
-struct conn *server_pool_conn(struct context *ctx, struct server_pool *pool, uint8_t *key, uint32_t keylen);
-rstatus_t server_pool_run(struct server_pool *pool);
+uint32_t servers_idx(struct servers *servers, uint8_t *key, uint32_t keylen);
+struct server *servers_server(struct servers *servers, uint8_t *key, uint32_t keylen);
+struct conn *server_pool_conn_frontend(struct context *ctx, struct server_pool *pool, uint8_t *key,
+                                       uint32_t keylen, struct server* input_server);
+struct conn *server_pool_conn_backend(struct context *ctx, struct server_pool *pool, uint8_t *key,
+                                      uint32_t keylen, struct server* input_server);
+
+rstatus_t servers_run(struct servers *servers);
 rstatus_t server_pool_preconnect(struct context *ctx);
 void server_pool_disconnect(struct context *ctx);
 rstatus_t server_pool_init(struct array *server_pool, struct array *conf_pool, struct context *ctx);

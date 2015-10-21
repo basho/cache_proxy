@@ -19,12 +19,32 @@
 #define _NC_MESSAGE_H_
 
 #include <nc_core.h>
+#include <nc_backend.h>
+#include "proto/riak.pb-c.h"
 
 typedef void (*msg_parse_t)(struct msg *);
 typedef rstatus_t (*msg_add_auth_t)(struct context *ctx, struct conn *c_conn, struct conn *s_conn);
 typedef rstatus_t (*msg_fragment_t)(struct msg *, uint32_t, struct msg_tqh *);
 typedef void (*msg_coalesce_t)(struct msg *r);
 typedef rstatus_t (*msg_reply_t)(struct msg *r);
+typedef rstatus_t (*msg_repack_t)(struct msg* r);
+
+typedef enum connection_type {
+    CONN_UNKNOWN,
+    CONN_RIAK,
+    CONN_REDIS,
+    CONN_MEMCACHE,
+} connection_type_t;
+
+typedef enum msg_find_result {
+    MSG_NOTFOUND,
+    MSG_FOUND
+} msg_find_result_t;
+
+extern struct string connection_strings[];
+
+TAILQ_HEAD(conn_tqh, conn);
+STAILQ_HEAD(serv_stqh, server);
 
 typedef enum msg_parse_result {
     MSG_PARSE_OK,                         /* parsing ok */
@@ -170,6 +190,11 @@ typedef enum msg_parse_result {
     ACTION( RSP_REDIS_INTEGER )                                                                     \
     ACTION( RSP_REDIS_BULK )                                                                        \
     ACTION( RSP_REDIS_MULTIBULK )                                                                   \
+    ACTION( REQ_RIAK_PING )                                                                         \
+    ACTION( REQ_RIAK_GET )                                                                          \
+    ACTION( RSP_RIAK_PING )                                                                         \
+    ACTION( RSP_RIAK_KV )                                                                           \
+    ACTION( RSP_RIAK_INTEGER )                                                                      \
     ACTION( SENTINEL )                                                                              \
 
 
@@ -182,6 +207,7 @@ typedef enum msg_type {
 struct keypos {
     uint8_t             *start;           /* key start pos */
     uint8_t             *end;             /* key end pos */
+    size_t              bucket_len;       /* length of bucket portion of key */
 };
 
 struct msg {
@@ -213,6 +239,15 @@ struct msg {
     msg_coalesce_t       pre_coalesce;    /* message pre-coalesce */
     msg_coalesce_t       post_coalesce;   /* message post-coalesce */
 
+    msg_backend_t        backend_process; /* message backend processing */
+
+    msg_backend_parser_t backend_parser;  /* message backend parsing */
+
+    msg_repack_t         repack;          /* repack a message */
+
+    /* An array of backend servers we can resend this message to */
+
+    struct array*        backend_resend_servers;
     msg_type_t           type;            /* message type */
 
     struct array         *keys;           /* array of keypos, for req */
@@ -244,6 +279,14 @@ struct msg {
     unsigned             fdone:1;         /* all fragments are done? */
     unsigned             swallow:1;       /* swallow response? */
     unsigned             redis:1;         /* redis? */
+    unsigned             riak:1;          /* riak? */
+};
+
+struct msg_pos {
+    struct msg* msg;
+    struct mbuf* mbuf;
+    uint8_t* ptr;
+    msg_find_result_t result;
 };
 
 TAILQ_HEAD(msg_tqh, msg);
@@ -255,11 +298,12 @@ void msg_tmo_delete(struct msg *msg);
 void msg_init(void);
 void msg_deinit(void);
 struct string *msg_type_string(msg_type_t type);
-struct msg *msg_get(struct conn *conn, bool request, bool redis);
+struct msg *msg_get(struct conn *conn, bool request);
 void msg_put(struct msg *msg);
-struct msg *msg_get_error(bool redis, err_t err);
+struct msg *msg_get_error(struct conn* conn, err_t err);
 void msg_dump(struct msg *msg, int level);
 bool msg_empty(struct msg *msg);
+bool msg_nil(struct msg *msg);
 rstatus_t msg_recv(struct context *ctx, struct conn *conn);
 rstatus_t msg_send(struct context *ctx, struct conn *conn);
 uint64_t msg_gen_frag_id(void);
@@ -281,15 +325,79 @@ void req_server_enqueue_omsgq(struct context *ctx, struct conn *conn, struct msg
 void req_client_dequeue_omsgq(struct context *ctx, struct conn *conn, struct msg *msg);
 void req_server_dequeue_omsgq(struct context *ctx, struct conn *conn, struct msg *msg);
 struct msg *req_recv_next(struct context *ctx, struct conn *conn, bool alloc);
-void req_recv_done(struct context *ctx, struct conn *conn, struct msg *msg, struct msg *nmsg);
+void req_recv_done(struct context *ctx, struct conn *conn, struct msg *msg, struct msg *nmsg, bool backend, bool enqueue);
 struct msg *req_send_next(struct context *ctx, struct conn *conn);
 void req_send_done(struct context *ctx, struct conn *conn, struct msg *msg);
 
 struct msg *rsp_get(struct conn *conn);
 void rsp_put(struct msg *msg);
 struct msg *rsp_recv_next(struct context *ctx, struct conn *conn, bool alloc);
-void rsp_recv_done(struct context *ctx, struct conn *conn, struct msg *msg, struct msg *nmsg);
+void rsp_recv_done(struct context *ctx, struct conn *conn, struct msg *msg, struct msg *nmsg, bool backend, bool enqueue);
 struct msg *rsp_send_next(struct context *ctx, struct conn *conn);
 void rsp_send_done(struct context *ctx, struct conn *conn, struct msg *msg);
+
+void rsp_forward(struct context *ctx, struct conn *s_conn, struct msg *msg);
+
+void rsp_get_peer(struct context *ctx, struct conn *s_conn, struct msg *msg);
+
+bool backend_process_req(struct context *ctx, struct conn *c_conn, struct msg* msg);
+bool backend_process_rsp(struct context *ctx, struct conn *c_conn, struct msg* msg);
+
+uint32_t msg_nbackend(struct msg* msg);
+connection_type_t msg_backend_type(struct msg* msg);
+
+rstatus_t backend_test_add_set_msg(struct context *ctx,
+            struct conn* c_conn, struct conn* s_conn,
+            char* keyname, char* keyval);
+
+rstatus_t backend_test_append_key(struct msg *r, uint8_t *key, uint32_t keylen);
+
+rstatus_t req_remap(struct conn* conn, struct msg* msg);
+
+struct msg *msg_content_clone(struct msg *src);
+
+rstatus_t msg_copy(struct msg *msg, uint8_t *pos, size_t n);
+rstatus_t msg_copy_char(struct msg *msg, char* pos, size_t n);
+
+rstatus_t msg_extract(struct msg *msg, uint8_t *pos, size_t n);
+rstatus_t msg_extract_char(struct msg *msg, char* pos, size_t n);
+
+void msg_rewind(struct msg* msg);
+void msg_reset_pos(struct msg* msg);
+
+struct msg_pos msg_pos_init(void);
+void msg_pos_init_start(struct msg* msg, struct msg_pos* pos);
+void msg_pos_init_last(struct msg* msg, struct msg_pos* pos);
+
+void msg_find(struct msg* src, uint8_t* search_seq, uint32_t search_seq_len,
+            struct msg_pos* start_pos, struct msg_pos* res_pos);
+
+void msg_find_char(struct msg* src, char* search_seq, uint32_t search_seq_len,
+            struct msg_pos* start_pos, struct msg_pos* res_pos);
+
+void msg_offset_from(struct msg_pos* start_pos, uint32_t offset, struct msg_pos* res_pos);
+
+rstatus_t msg_offset_between(struct msg_pos* start_pos, struct msg_pos* end_pos, uint32_t* offset);
+
+bool msg_pos_is_valid(struct msg_pos* pos);
+
+rstatus_t msg_copy_between_pos(struct msg* dest, struct msg_pos* start_pos, struct msg_pos* end_pos);
+
+rstatus_t msg_copy_from_pos(struct msg* dest, struct msg_pos* start_pos, size_t n);
+
+rstatus_t msg_extract_between_pos(uint8_t*   dest, struct msg_pos* start_pos, struct msg_pos* end_pos);
+rstatus_t msg_extract_between_pos_char(char* dest, struct msg_pos* start_pos, struct msg_pos* end_pos);
+
+rstatus_t msg_extract_from_pos(uint8_t*   dest, struct msg_pos* start_pos, size_t n);
+rstatus_t msg_extract_from_pos_char(char* dest, struct msg_pos* start_pos, size_t n);
+
+struct server_pool* msg_get_server_pool(struct msg* r);
+
+void msg_print(struct msg* msg);
+void msg_get_printable(struct msg* msg, char* buf);
+
+const uint8_t* msg_key0(struct msg* req, size_t* bucket_len, size_t* key_len);
+
+void msg_set_keypos(struct msg* req, uint32_t keyn, int start_offset, int len, size_t bucket_len);
 
 #endif

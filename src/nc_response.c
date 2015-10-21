@@ -25,7 +25,7 @@ rsp_get(struct conn *conn)
 
     ASSERT(!conn->client && !conn->proxy);
 
-    msg = msg_get(conn, false, conn->redis);
+    msg = msg_get(conn, false);
     if (msg == NULL) {
         conn->err = errno;
     }
@@ -80,7 +80,7 @@ rsp_make_error(struct context *ctx, struct conn *conn, struct msg *msg)
         rsp_put(pmsg);
     }
 
-    return msg_get_error(conn->redis, err);
+    return msg_get_error(conn, err);
 }
 
 struct msg *
@@ -141,7 +141,7 @@ rsp_recv_next(struct context *ctx, struct conn *conn, bool alloc)
 static bool
 rsp_filter(struct context *ctx, struct conn *conn, struct msg *msg)
 {
-    struct msg *pmsg;
+    struct msg *pmsg=0;
 
     ASSERT(!conn->client && !conn->proxy);
 
@@ -184,11 +184,38 @@ rsp_filter(struct context *ctx, struct conn *conn, struct msg *msg)
     ASSERT(pmsg->peer == NULL);
     ASSERT(pmsg->request && !pmsg->done);
 
+    /*
+    * Exercise backend if a backend pool is configured.  The call
+    * returns true if backend processing resulted in new messages to
+    * the backend servers, causing the current response not to be
+    * forwarded to the client
+    */
+
+    if (msg->backend_process(ctx, conn, msg)) {
+        return true;
+    }
+
+    /*
+    * If the peer message should not be responded to, swallow the
+    * message and mark the peer message as completed (dequeue it from
+    * the output queue)
+    */
+
     if (pmsg->swallow) {
         conn->swallow_msg(conn, pmsg, msg);
 
-        conn->dequeue_outq(ctx, conn, pmsg);
-        pmsg->done = 1;
+        /* If marked done upstream, the inq should be re-evented. */
+        if (pmsg->done) {
+          if (TAILQ_EMPTY(&conn->imsg_q)) {
+            if (event_add_in(ctx->evb, conn) != NC_OK) {
+              conn->err = errno;
+              return true;
+            }
+          }
+        } else {
+            conn->dequeue_outq(ctx, conn, pmsg);
+            pmsg->done = 1;
+        }
 
         log_debug(LOG_INFO, "swallow rsp %"PRIu64" len %"PRIu32" of req "
                   "%"PRIu64" on s %d", msg->id, msg->mlen, pmsg->id,
@@ -196,6 +223,7 @@ rsp_filter(struct context *ctx, struct conn *conn, struct msg *msg)
 
         rsp_put(msg);
         req_put(pmsg);
+
         return true;
     }
 
@@ -211,7 +239,33 @@ rsp_forward_stats(struct context *ctx, struct server *server, struct msg *msg, u
     stats_server_incr_by(ctx, server, response_bytes, msgsize);
 }
 
-static void
+/**.......................................................................
+ * Retrieve the peer message (request) that a response corresponds to
+ */
+void
+rsp_get_peer(struct context *ctx, struct conn *s_conn, struct msg *msg)
+{
+    struct msg* pmsg = 0;
+
+    ASSERT(!s_conn->client && !s_conn->proxy);
+
+    /* response from server implies that server is ok and heartbeating */
+    server_ok(ctx, s_conn);
+
+    /* dequeue peer message (request) from server */
+    pmsg = TAILQ_FIRST(&s_conn->omsg_q);
+    ASSERT(pmsg != NULL && pmsg->peer == NULL);
+    ASSERT(pmsg->request && !pmsg->done);
+
+    s_conn->dequeue_outq(ctx, s_conn, pmsg);
+    pmsg->done = 1;
+
+    /* establish msg <-> pmsg (response <-> request) link */
+    pmsg->peer = msg;
+    msg->peer = pmsg;
+}
+
+void
 rsp_forward(struct context *ctx, struct conn *s_conn, struct msg *msg)
 {
     rstatus_t status;
@@ -253,8 +307,8 @@ rsp_forward(struct context *ctx, struct conn *s_conn, struct msg *msg)
 }
 
 void
-rsp_recv_done(struct context *ctx, struct conn *conn, struct msg *msg,
-              struct msg *nmsg)
+rsp_recv_done(struct context *ctx, struct conn *conn,
+              struct msg *msg, struct msg *nmsg, bool backend, bool enqueue)
 {
     ASSERT(!conn->client && !conn->proxy);
     ASSERT(msg != NULL && conn->rmsg == msg);
@@ -264,6 +318,21 @@ rsp_recv_done(struct context *ctx, struct conn *conn, struct msg *msg,
 
     /* enqueue next message (response), if any */
     conn->rmsg = nmsg;
+
+    /*
+    * rsp_filter returning true means either:
+    *
+    * 1) error, in which case we don't forward the response to the
+    * client,
+    *
+    * or
+    *
+    * 2) that the peer message shouldn't be responded to.  This can
+    * happen if pmsg->swallow is true, or if the response caused
+    * another message or messages to be sent to backend servers, in
+    * which case we also don't want to reply to the current peer
+    * message (yet)
+    */
 
     if (rsp_filter(ctx, conn, msg)) {
         return;

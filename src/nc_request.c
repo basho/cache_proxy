@@ -18,6 +18,21 @@
 #include <nc_core.h>
 #include <nc_server.h>
 
+void req_forward(struct context *ctx, struct conn *c_conn, struct msg *msg, bool backend, bool enqueue);
+
+/*
+* Backend processing utilities
+*/
+
+/* Return true if this request should be forwarded to the backend servers*/
+bool should_forward_req_to_backend(struct conn *c_conn, struct msg* msg);
+
+/*
+* Get the next request to send -- returns NULL instead of the next
+* message if we are still waiting for a response to the last request
+*/
+struct msg* get_next_req_to_send(struct msg* nmsg);
+
 struct msg *
 req_get(struct conn *conn)
 {
@@ -25,7 +40,7 @@ req_get(struct conn *conn)
 
     ASSERT(conn->client && !conn->proxy);
 
-    msg = msg_get(conn, true, conn->redis);
+    msg = msg_get(conn, true);
     if (msg == NULL) {
         conn->err = errno;
     }
@@ -88,12 +103,39 @@ req_log(struct msg *req)
 
     req_type = msg_type_string(req->type);
 
+  /*
+   * FIXME: add backend addr here
+   * Maybe we can store addrstr just like server_pool in conn struct
+   * when connections are resolved
+   */
+  peer_str = nc_unresolve_peer_desc(req->owner->sd);
+
+  req_type = msg_type_string(req->type);
+
+  size_t bucket_len = 0;
+  size_t key_len = 0;
+  const uint8_t *key0 = msg_key0(req, &bucket_len, &key_len);
+
+  if (bucket_len <= 0) {
     log_debug(LOG_NOTICE, "req %"PRIu64" done on c %d req_time %"PRIi64".%03"PRIi64
-              " msec type %.*s narg %"PRIu32" req_len %"PRIu32" rsp_len %"PRIu32
-              " key0 '%s' peer '%s' done %d error %d",
-              req->id, req->owner->sd, req_time / 1000, req_time % 1000,
-              req_type->len, req_type->data, req->narg, req_len, rsp_len,
-              kpos->start, peer_str, req->done, req->error);
+        " msec type %.*s narg %"PRIu32" req_len %"PRIu32" rsp_len %"PRIu32
+        " key0 '%.*s'"
+        " peer '%s' done %d error %d",
+        req->id, req->owner->sd, req_time / 1000, req_time % 1000,
+        req_type->len, req_type->data, req->narg, req_len, rsp_len,
+        key_len, key0, /*<< key portion*/
+        peer_str, req->done, req->error);
+  } else {
+    log_debug(LOG_NOTICE, "req %"PRIu64" done on c %d req_time %"PRIi64".%03"PRIi64
+        " msec type %.*s narg %"PRIu32" req_len %"PRIu32" rsp_len %"PRIu32
+        " key0 '%.*s:%.*s'"
+        " peer '%s' done %d error %d",
+        req->id, req->owner->sd, req_time / 1000, req_time % 1000,
+        req_type->len, req_type->data, req->narg, req_len, rsp_len,
+        bucket_len, key0, /*<< bucket portion*/
+        key_len, key0 + bucket_len + 1, /*<< key portion*/
+        peer_str, req->done, req->error);
+  }
 }
 
 void
@@ -128,12 +170,12 @@ req_put(struct msg *msg)
 bool
 req_done(struct conn *conn, struct msg *msg)
 {
-    struct msg *cmsg, *pmsg; /* current and previous message */
+    struct msg *cmsg;        /* current message */
     uint64_t id;             /* fragment id */
     uint32_t nfragment;      /* # fragment */
 
     ASSERT(conn->client && !conn->proxy);
-    ASSERT(msg->request);
+    ASSERT(msg->request || msg->error);
 
     if (!msg->done) {
         return false;
@@ -155,18 +197,18 @@ req_done(struct conn *conn, struct msg *msg)
 
     /* check all fragments of the given request vector are done */
 
-    for (pmsg = msg, cmsg = TAILQ_PREV(msg, msg_tqh, c_tqe);
+    for (cmsg = TAILQ_PREV(msg, msg_tqh, c_tqe);
          cmsg != NULL && cmsg->frag_id == id;
-         pmsg = cmsg, cmsg = TAILQ_PREV(cmsg, msg_tqh, c_tqe)) {
+         cmsg = TAILQ_PREV(cmsg, msg_tqh, c_tqe)) {
 
         if (!cmsg->done) {
             return false;
         }
     }
 
-    for (pmsg = msg, cmsg = TAILQ_NEXT(msg, c_tqe);
+    for (cmsg = TAILQ_NEXT(msg, c_tqe);
          cmsg != NULL && cmsg->frag_id == id;
-         pmsg = cmsg, cmsg = TAILQ_NEXT(cmsg, c_tqe)) {
+         cmsg = TAILQ_NEXT(cmsg, c_tqe)) {
 
         if (!cmsg->done) {
             return false;
@@ -184,21 +226,19 @@ req_done(struct conn *conn, struct msg *msg)
     msg->fdone = 1;
     nfragment = 0;
 
-    for (pmsg = msg, cmsg = TAILQ_PREV(msg, msg_tqh, c_tqe);
+    for (cmsg = TAILQ_PREV(msg, msg_tqh, c_tqe);
          cmsg != NULL && cmsg->frag_id == id;
-         pmsg = cmsg, cmsg = TAILQ_PREV(cmsg, msg_tqh, c_tqe)) {
+         cmsg = TAILQ_PREV(cmsg, msg_tqh, c_tqe)) {
         cmsg->fdone = 1;
         nfragment++;
     }
 
-    for (pmsg = msg, cmsg = TAILQ_NEXT(msg, c_tqe);
+    for (cmsg = TAILQ_NEXT(msg, c_tqe);
          cmsg != NULL && cmsg->frag_id == id;
-         pmsg = cmsg, cmsg = TAILQ_NEXT(cmsg, c_tqe)) {
+         cmsg = TAILQ_NEXT(cmsg, c_tqe)) {
         cmsg->fdone = 1;
         nfragment++;
     }
-
-    ASSERT(msg->frag_owner->nfrag == nfragment);
 
     msg->post_coalesce(msg->frag_owner);
 
@@ -302,7 +342,7 @@ req_server_enqueue_imsgq(struct context *ctx, struct conn *conn, struct msg *msg
      * the server in_q; the clock continues to tick until it either expires
      * or the message is dequeued from the server out_q
      *
-     * noreply request are free from timeouts because client is not intrested
+     * noreply request are free from timeouts because client is not interested
      * in the response anyway!
      */
     if (!msg->noreply) {
@@ -360,6 +400,11 @@ req_client_enqueue_omsgq(struct context *ctx, struct conn *conn, struct msg *msg
     TAILQ_INSERT_TAIL(&conn->omsg_q, msg, c_tqe);
 }
 
+/**.......................................................................
+ * Enqueue a request in the output message queue of the server.
+ * Called when a request is written to a server and we are waiting for
+ * a response.
+ */
 void
 req_server_enqueue_omsgq(struct context *ctx, struct conn *conn, struct msg *msg)
 {
@@ -372,6 +417,11 @@ req_server_enqueue_omsgq(struct context *ctx, struct conn *conn, struct msg *msg
     stats_server_incr_by(ctx, conn->owner, out_queue_bytes, msg->mlen);
 }
 
+/**.......................................................................
+ * Dequeue a request from the output message queue of the client.
+ * Called when a response has been read back from a server and is
+ * forwarded back to the client.
+ */
 void
 req_client_dequeue_omsgq(struct context *ctx, struct conn *conn, struct msg *msg)
 {
@@ -381,6 +431,10 @@ req_client_dequeue_omsgq(struct context *ctx, struct conn *conn, struct msg *msg
     TAILQ_REMOVE(&conn->omsg_q, msg, c_tqe);
 }
 
+/**.......................................................................
+ * Dequeue a request from a server's output message queue.  Called
+ * when a response has been read back from the server
+ */
 void
 req_server_dequeue_omsgq(struct context *ctx, struct conn *conn, struct msg *msg)
 {
@@ -388,7 +442,6 @@ req_server_dequeue_omsgq(struct context *ctx, struct conn *conn, struct msg *msg
     ASSERT(!conn->client && !conn->proxy);
 
     msg_tmo_delete(msg);
-
     TAILQ_REMOVE(&conn->omsg_q, msg, s_tqe);
 
     stats_server_decr(ctx, conn->owner, out_queue);
@@ -455,7 +508,7 @@ req_make_reply(struct context *ctx, struct conn *conn, struct msg *req)
 {
     struct msg *msg;
 
-    msg = msg_get(conn, false, conn->redis); /* replay */
+    msg = msg_get(conn, false);
     if (msg == NULL) {
         conn->err = errno;
         return NC_ENOMEM;
@@ -551,38 +604,54 @@ req_forward_stats(struct context *ctx, struct server *server, struct msg *msg)
     stats_server_incr_by(ctx, server, request_bytes, msg->mlen);
 }
 
-static void
-req_forward(struct context *ctx, struct conn *c_conn, struct msg *msg)
+void
+req_forward(struct context *ctx, struct conn *c_conn, struct msg *msg, bool backend, bool enqueue)
 {
     rstatus_t status;
     struct conn *s_conn;
-    struct server_pool *pool;
     uint8_t *key;
     uint32_t keylen;
     struct keypos *kpos;
 
     ASSERT(c_conn->client && !c_conn->proxy);
 
-    /* enqueue message (request) into client outq, if response is expected */
-    if (!msg->noreply) {
+    if (!msg->noreply && enqueue) {
         c_conn->enqueue_outq(ctx, c_conn, msg);
     }
 
-    pool = c_conn->owner;
-
     ASSERT(array_n(msg->keys) > 0);
+    /* TODO: investigate key here, seeing logged messages w/ incorrect key
+    * this is not terribly important for Riak as a backend under happy path,
+    * but in the face of a network partition, the consistent routing of
+    * requests based on key to a specific coordinator is important.
+    */
     kpos = array_get(msg->keys, 0);
     key = kpos->start;
     keylen = (uint32_t)(kpos->end - kpos->start);
 
-    s_conn = server_pool_conn(ctx, c_conn->owner, key, keylen);
+    struct server *server = NULL;
+    struct server_pool *pool = (struct server_pool *)c_conn->owner;
+
+    if (backend) {
+        do {
+            server = get_next_backend_server(msg, c_conn, key, keylen);
+            s_conn = server_pool_conn_backend(ctx, pool, key, keylen, server);
+        } while (!backend_resend_q_empty(msg) && s_conn==NULL);
+    } else {
+        s_conn = server_pool_conn_frontend(ctx, pool, key, keylen, server);
+    }
+
     if (s_conn == NULL) {
-        req_forward_error(ctx, c_conn, msg);
+        msg->error = 1;
         return;
     }
     ASSERT(!s_conn->client && !s_conn->proxy);
 
-    /* enqueue the message (request) into server inq */
+    if (s_conn->req_remap(s_conn, msg)==NC_ERROR) {
+      msg->error = 1;
+      return;
+    }
+
     if (TAILQ_EMPTY(&s_conn->imsg_q)) {
         status = event_add_out(ctx->evb, s_conn);
         if (status != NC_OK) {
@@ -608,17 +677,28 @@ req_forward(struct context *ctx, struct conn *c_conn, struct msg *msg)
     log_debug(LOG_VERB, "forward from c %d to s %d req %"PRIu64" len %"PRIu32
               " type %d with key '%.*s'", c_conn->sd, s_conn->sd, msg->id,
               msg->mlen, msg->type, keylen, key);
+
+    /* NOTE: we shall NOT enqueue post messages here, the point of post messages
+    * is to use value gained by having performed the request+response cycle, ie
+    * getting the vclock of a Riak object.
+    */
 }
 
+/**.......................................................................
+ * Called on receipt of a request by a client connection.
+ *
+ * This function forwards the request to the server pool, optionally
+ * fragmenting the message across multiple servers.
+ */
 void
 req_recv_done(struct context *ctx, struct conn *conn, struct msg *msg,
-              struct msg *nmsg)
+              struct msg *nmsg, bool backend, bool enqueue)
 {
     rstatus_t status;
     struct server_pool *pool;
     struct msg_tqh frag_msgq;
     struct msg *sub_msg;
-    struct msg *tmsg; 			/* tmp next message */
+    struct msg *tmsg; /* tmp next message */
 
     ASSERT(conn->client && !conn->proxy);
     ASSERT(msg->request);
@@ -631,6 +711,12 @@ req_recv_done(struct context *ctx, struct conn *conn, struct msg *msg,
 
     if (req_filter(ctx, conn, msg)) {
         return;
+    }
+
+    if (backend == false) {
+        if (should_forward_req_to_backend(conn, msg)) {
+            backend = true;
+        }
     }
 
     if (msg->noforward) {
@@ -654,27 +740,29 @@ req_recv_done(struct context *ctx, struct conn *conn, struct msg *msg,
         return;
     }
 
-    /* do fragment */
     pool = conn->owner;
     TAILQ_INIT(&frag_msgq);
-    status = msg->fragment(msg, pool->ncontinuum, &frag_msgq);
+    status = msg->fragment(msg, pool->frontends.ncontinuum, &frag_msgq);
     if (status != NC_OK) {
         if (!msg->noreply) {
-            conn->enqueue_outq(ctx, conn, msg);
+            if (enqueue) {
+                conn->enqueue_outq(ctx, conn, msg);
+            }
         }
         req_forward_error(ctx, conn, msg);
     }
 
-    /* if no fragment happened */
     if (TAILQ_EMPTY(&frag_msgq)) {
-        req_forward(ctx, conn, msg);
+        req_forward(ctx, conn, msg, backend, enqueue);
         return;
     }
 
     status = req_make_reply(ctx, conn, msg);
     if (status != NC_OK) {
         if (!msg->noreply) {
-            conn->enqueue_outq(ctx, conn, msg);
+            if (enqueue) {
+                conn->enqueue_outq(ctx, conn, msg);
+            }
         }
         req_forward_error(ctx, conn, msg);
     }
@@ -683,7 +771,7 @@ req_recv_done(struct context *ctx, struct conn *conn, struct msg *msg,
         tmsg = TAILQ_NEXT(sub_msg, m_tqe);
 
         TAILQ_REMOVE(&frag_msgq, sub_msg, m_tqe);
-        req_forward(ctx, conn, sub_msg);
+        req_forward(ctx, conn, sub_msg, backend, enqueue);
     }
 
     ASSERT(TAILQ_EMPTY(&frag_msgq));
@@ -719,6 +807,8 @@ req_send_next(struct context *ctx, struct conn *conn)
         nmsg = TAILQ_NEXT(msg, s_tqe);
     }
 
+    nmsg = get_next_req_to_send(nmsg);
+
     conn->smsg = nmsg;
 
     if (nmsg == NULL) {
@@ -729,6 +819,50 @@ req_send_next(struct context *ctx, struct conn *conn)
 
     log_debug(LOG_VVERB, "send next req %"PRIu64" len %"PRIu32" type %d on "
               "s %d", nmsg->id, nmsg->mlen, nmsg->type, conn->sd);
+
+    return nmsg;
+}
+
+/**.......................................................................
+ * Return the next request to send to the server
+ */
+struct msg *
+get_next_req_to_send(struct msg* nmsg)
+{
+    if (nmsg != NULL) {
+        /*
+        * See if this message's owner pool has backend servers -- if it
+        * does, and this is a message that might be forwarded to the
+        * backend, we enforce that requests are only sent if they are at
+        * the head of the client's output queue.  This ensures that the
+        * previous request has been responded to before the next request
+        * is sent.  If we don't, then we can get in a situation where the
+        * backend responds to requests out of order.
+        */
+
+        struct conn* client = nmsg->owner;
+        struct server_pool* sp = (struct server_pool*)client->owner;
+        if (sp != NULL) {
+            unsigned nbackend = sp->backends.server_arr.nelem;
+
+            /*
+            * If this is a fragmented message, it won't be the head of the
+            * client omsg_q -- its fragments will be -- so go ahead and send
+            * it anyway (for the time being anyway, we won't be forwarding
+            * fragmented messages to the backend).  Also, if this message
+            * expects no reply, send it, since the reply -- and thus the
+            * order of the reply -- is irrelevant.
+            */
+
+            if (nbackend > 0 && nmsg->frag_id == 0 && !nmsg->swallow) {
+                struct msg* clientHead = TAILQ_FIRST(&client->omsg_q);
+
+                if (nmsg != clientHead) {
+                    return NULL;
+                }
+            }
+        }
+    }
 
     return nmsg;
 }
@@ -757,4 +891,34 @@ req_send_done(struct context *ctx, struct conn *conn, struct msg *msg)
     } else {
         req_put(msg);
     }
+}
+
+rstatus_t
+req_remap(struct conn* conn, struct msg *msg)
+{
+    return NC_OK;
+}
+
+/**.......................................................................
+ * Return true if this request should be forward to the backend
+ */
+bool
+should_forward_req_to_backend(struct conn *c_conn, struct msg* msg)
+{
+    if (conn_nbackend(c_conn) == 0) {
+        return false;
+    }
+
+    switch(msg->type) {
+    case MSG_REQ_REDIS_SET:
+        return true;
+
+    case MSG_REQ_REDIS_DEL:
+        return true;
+
+    default:
+        break;
+    }
+
+    return false;
 }

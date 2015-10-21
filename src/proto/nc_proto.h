@@ -158,4 +158,33 @@ rstatus_t redis_reply(struct msg *r);
 void redis_post_connect(struct context *ctx, struct conn *conn, struct server *server);
 void redis_swallow_msg(struct conn *conn, struct msg *pmsg, struct msg *msg);
 
+/* NB. streaming requests to Riak could be implemented with coalesce handlers
+ *     but have not yet been added. Also note there's no support for otherwise
+ *     fragmented messages, or auth.
+ */
+void riak_parse_req(struct msg *r);
+void riak_parse_rsp(struct msg *r);
+void riak_pre_coalesce(struct msg *r);
+void riak_post_coalesce(struct msg *r);
+rstatus_t riak_add_auth_packet(struct context *ctx, struct conn *c_conn, struct conn *s_conn);
+rstatus_t riak_fragment(struct msg *r, uint32_t ncontinuum, struct msg_tqh *frag_msgq);
+void riak_post_connect(struct context *ctx, struct conn *conn, struct server *server);
+void riak_swallow_msg(struct conn *conn, struct msg *pmsg, struct msg *msg);
+
+struct msg* riak_rsp_recv_next(struct context *ctx, struct conn *conn, bool alloc);
+struct msg* riak_req_send_next(struct context *ctx, struct conn *conn);
+rstatus_t riak_req_remap(struct conn* conn, struct msg* msg);
+rstatus_t riak_repack(struct msg* r);
+rstatus_t redis_repack(struct msg* r);
+rstatus_t memcache_repack(struct msg* r);
+
+rstatus_t add_set_msg_redis(struct context *ctx, struct conn* c_conn, struct msg* msg);
+
+rstatus_t add_set_msg_riak(struct context *ctx, struct conn* c_conn, struct msg* msg);
+
+rstatus_t add_set_msg_key(struct context *ctx, struct conn* c_conn, char* keyname,
+                          struct msg_pos* keyval_start_pos, uint32_t keyvallen);
+
+rstatus_t redis_get_next_string(struct msg* msg, struct msg_pos* init_pos, struct msg_pos* start_pos, size_t* len);
+
 #endif

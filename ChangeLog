@@ -1,5 +1,15 @@
-2014-18-10  idning <idning@gmail.com>
+  2015-08-21  paegun <l2paegun@hotmail.com>
+    * cache_proxy: version 1.0.0, fork from twemproxy 0.4.0
+      added backend server, supporting only Riak
+      added read-through caching strategy for GET command
+      this change is a rollup of the research and development of
+	  several contributors including:
+        aberghage <aberghage@gmail.com>
+        erikleitch <eleitch@basho.com>
+        paegun <l2paegun@hotmail.com>
+        Nikolay-Kha <Nikolay.Khabarov@dataart.com>
 
+2014-18-10  idning <idning@gmail.com>
     * twemproxy: version 0.4.0 release
       mget improve (idning)
       many new commands supported: LEX, PFADD, PFMERGE, SORT, PING, QUIT, SCAN... (mattrobenolt, areina, idning)

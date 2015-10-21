@@ -211,10 +211,12 @@ proxy_each_init(void *elem, void *data)
     }
 
     log_debug(LOG_NOTICE, "p %d listening on '%.*s' in %s pool %"PRIu32" '%.*s'"
-              " with %"PRIu32" servers", p->sd, pool->addrstr.len,
+              " with %"PRIu32" frontend servers and %"PRIu32" backend %s %s", p->sd, pool->addrstr.len,
               pool->addrstr.data, pool->redis ? "redis" : "memcache",
               pool->idx, pool->name.len, pool->name.data,
-              array_n(&pool->server));
+              array_n(&pool->frontends.server_arr), array_n(&pool->backends.server_arr),
+              (array_n(&pool->backends.server_arr)==0 ? "" : (char*)connection_strings[pool->backend_opt.type].data),
+              (array_n(&pool->backends.server_arr)==1 ? "server" : "servers"));
 
     return NC_OK;
 }
@@ -335,7 +337,7 @@ proxy_accept(struct context *ctx, struct conn *p)
         return NC_OK;
     }
 
-    c = conn_get(p->owner, true, p->redis);
+    c = conn_get(p->owner, true, (p->type ? CONN_REDIS : CONN_MEMCACHE));
     if (c == NULL) {
         log_error("get conn for c %d from p %d failed: %s", sd, p->sd,
                   strerror(errno));

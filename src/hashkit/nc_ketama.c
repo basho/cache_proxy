@@ -55,7 +55,7 @@ ketama_item_cmp(const void *t1, const void *t2)
 }
 
 rstatus_t
-ketama_update(struct server_pool *pool)
+ketama_update(struct servers *servers)
 {
     uint32_t nserver;             /* # server - live and dead */
     uint32_t nlive_server;        /* # live server */
@@ -71,7 +71,10 @@ ketama_update(struct server_pool *pool)
     uint32_t total_weight;        /* total live server weight */
     int64_t now;                  /* current timestamp in usec */
 
-    ASSERT(array_n(&pool->server) > 0);
+    ASSERT(array_n(&servers->server_arr) > 0);
+    ASSERT(servers->owner != NULL );
+    const struct server_pool *pool = servers->owner;
+
 
     now = nc_usec_now();
     if (now < 0) {
@@ -82,20 +85,20 @@ ketama_update(struct server_pool *pool)
      * Count live servers and total weight, and also update the next time to
      * rebuild the distribution
      */
-    nserver = array_n(&pool->server);
+    nserver = array_n(&servers->server_arr);
     nlive_server = 0;
     total_weight = 0;
-    pool->next_rebuild = 0LL;
+    servers->next_rebuild = 0LL;
     for (server_index = 0; server_index < nserver; server_index++) {
-        struct server *server = array_get(&pool->server, server_index);
+        struct server *server = array_get(&servers->server_arr, server_index);
 
         if (pool->auto_eject_hosts) {
             if (server->next_retry <= now) {
                 server->next_retry = 0LL;
                 nlive_server++;
-            } else if (pool->next_rebuild == 0LL ||
-                       server->next_retry < pool->next_rebuild) {
-                pool->next_rebuild = server->next_retry;
+            } else if (servers->next_rebuild == 0LL ||
+                       server->next_retry < servers->next_rebuild) {
+                servers->next_rebuild = server->next_retry;
             }
         } else {
             nlive_server++;
@@ -109,7 +112,7 @@ ketama_update(struct server_pool *pool)
         }
     }
 
-    pool->nlive_server = nlive_server;
+    servers->nlive_server = nlive_server;
 
     if (nlive_server == 0) {
         log_debug(LOG_DEBUG, "no live servers for pool %"PRIu32" '%.*s'",
@@ -127,18 +130,18 @@ ketama_update(struct server_pool *pool)
      * Allocate the continuum for the pool, the first time, and every time we
      * add a new server to the pool
      */
-    if (nlive_server > pool->nserver_continuum) {
-        struct continuum *continuum;
-        uint32_t nserver_continuum = nlive_server + continuum_addition;
-        uint32_t ncontinuum = nserver_continuum * points_per_server;
+    if (nlive_server > servers->nserver_continuum) {
+        struct continuum *new_continuum;
+        uint32_t new_nserver_continuum = nlive_server + continuum_addition;
+        uint32_t new_ncontinuum = new_nserver_continuum * points_per_server;
 
-        continuum = nc_realloc(pool->continuum, sizeof(*continuum) * ncontinuum);
-        if (continuum == NULL) {
+        new_continuum = nc_realloc(servers->continuum, sizeof(*new_continuum) * new_ncontinuum);
+        if (new_continuum == NULL) {
             return NC_ENOMEM;
         }
 
-        pool->continuum = continuum;
-        pool->nserver_continuum = nserver_continuum;
+        servers->continuum = new_continuum;
+        servers->nserver_continuum = new_nserver_continuum;
         /* pool->ncontinuum is initialized later as it could be <= ncontinuum */
     }
 
@@ -152,7 +155,7 @@ ketama_update(struct server_pool *pool)
         struct server *server;
         float pct;
 
-        server = array_get(&pool->server, server_index);
+        server = array_get(&servers->server_arr, server_index);
 
         if (pool->auto_eject_hosts && server->next_retry > now) {
             continue;
@@ -181,15 +184,15 @@ ketama_update(struct server_pool *pool)
 
             for (x = 0; x < pointer_per_hash; x++) {
                 value = ketama_hash(host, hostlen, x);
-                pool->continuum[continuum_index].index = server_index;
-                pool->continuum[continuum_index++].value = value;
+                (servers->continuum)[continuum_index].index = server_index;
+                (servers->continuum)[continuum_index++].value = value;
             }
         }
         pointer_counter += pointer_per_server;
     }
 
-    pool->ncontinuum = pointer_counter;
-    qsort(pool->continuum, pool->ncontinuum, sizeof(*pool->continuum),
+    servers->ncontinuum = pointer_counter;
+    qsort(servers->continuum, servers->ncontinuum, sizeof(servers->ncontinuum),
           ketama_item_cmp);
 
     for (pointer_index = 0;
@@ -198,16 +201,16 @@ ketama_update(struct server_pool *pool)
         if (pointer_index + 1 >= pointer_counter) {
             break;
         }
-        ASSERT(pool->continuum[pointer_index].value <=
-               pool->continuum[pointer_index + 1].value);
+        ASSERT((servers->continuum)[pointer_index].value <=
+               (servers->continuum)[pointer_index + 1].value);
     }
 
     log_debug(LOG_VERB, "updated pool %"PRIu32" '%.*s' with %"PRIu32" of "
               "%"PRIu32" servers live in %"PRIu32" slots and %"PRIu32" "
               "active points in %"PRIu32" slots", pool->idx,
               pool->name.len, pool->name.data, nlive_server, nserver,
-              pool->nserver_continuum, pool->ncontinuum,
-              (pool->nserver_continuum + continuum_addition) * points_per_server);
+              servers->nserver_continuum, servers->ncontinuum,
+              (servers->nserver_continuum + continuum_addition) * points_per_server);
 
     return NC_OK;
 }

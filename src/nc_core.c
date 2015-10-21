@@ -24,6 +24,9 @@
 
 static uint32_t ctx_id; /* context generation */
 
+rstatus_t core_readd_out(struct context* ctx, struct conn* conn);
+rstatus_t core_readd_in(struct context* ctx, struct conn* conn);
+
 static rstatus_t
 core_calc_connections(struct context *ctx)
 {
@@ -196,7 +199,11 @@ core_recv(struct context *ctx, struct conn *conn)
         log_debug(LOG_INFO, "recv on %c %d failed: %s",
                   conn->client ? 'c' : (conn->proxy ? 'p' : 's'), conn->sd,
                   strerror(errno));
+        return status;
     }
+
+    status = core_readd_in(ctx, conn);
+    status = core_readd_out(ctx, conn);
 
     return status;
 }
@@ -211,9 +218,43 @@ core_send(struct context *ctx, struct conn *conn)
         log_debug(LOG_INFO, "send on %c %d failed: status: %d errno: %d %s",
                   conn->client ? 'c' : (conn->proxy ? 'p' : 's'), conn->sd,
                   status, errno, strerror(errno));
+        return status;
     }
 
+    status = core_readd_out(ctx, conn);
+    status = core_readd_in(ctx, conn);
+
     return status;
+}
+
+rstatus_t
+core_readd_out(struct context* ctx, struct conn* conn)
+{
+    if (!conn->client)
+    {
+        if (!TAILQ_EMPTY(&conn->imsg_q))
+        {
+            conn->send_active = false;
+            return event_add_out(ctx->evb, conn);
+        }
+    }
+
+  return NC_OK;
+}
+
+rstatus_t
+core_readd_in(struct context* ctx, struct conn* conn)
+{
+    if (!conn->client)
+    {
+        if (!TAILQ_EMPTY(&conn->omsg_q))
+        {
+            conn->recv_active = false;
+            return event_add_in(ctx->evb, conn);
+        }
+    }
+
+  return NC_OK;
 }
 
 static void
@@ -318,6 +359,12 @@ core_core(void *arg, uint32_t events)
 
     conn->events = events;
 
+    if ((events & EVENT_ERR) ||
+        (events & EVENT_READ) ||
+        (events & EVENT_WRITE)) {
+        core_log_msg_queues(ctx);
+    }
+
     /* error takes precedence over read | write */
     if (events & EVENT_ERR) {
         core_error(ctx, conn);
@@ -342,6 +389,110 @@ core_core(void *arg, uint32_t events)
     }
 
     return NC_OK;
+}
+
+void
+_core_log_msg_queues(struct context *ctx)
+{
+    uint32_t i;
+    log_debug(LOG_DEBUG, "-----------------loop data----------------");
+    struct server_pool *pool;
+    for (i = 0; i < ctx->pool.nelem; i++) {
+        pool = array_get(&ctx->pool, i);
+        _core_log_msg_queues_pool(pool);
+    }
+}
+
+void
+_core_log_msg_queues_pool(struct server_pool *pool)
+{
+    log_debug(LOG_DEBUG, "**** Listen '%.*s' queue:", pool->addrstr.len,
+              pool->addrstr.data);
+    _core_log_msg_queues_client(pool);
+    _core_log_msg_queues_server_arr("Frontend", &pool->frontends.server_arr);
+    _core_log_msg_queues_server_arr("Backend ", &pool->backends.server_arr);
+}
+
+void
+_core_log_msg_queues_server_arr(char* pool_type, struct array *server_arr)
+{
+    uint32_t i, n;
+    struct server *server;
+    n = array_n(server_arr);
+    for (i = 0; i < n; i++) {
+        server = array_get(server_arr, i);
+        log_debug(LOG_DEBUG, "**** %s server '%.*s' queue:", pool_type,
+                  server->name.len, server->name.data);
+        _core_log_msg_queues_server(server);
+    }
+}
+
+void
+_core_log_msg_queues_client(struct server_pool *pool)
+{
+    struct conn *conn;
+    TAILQ_FOREACH(conn, &pool->c_conn_q, conn_tqe)
+    {
+        _core_log_msg_queues_connection(conn);
+    }
+}
+
+void
+_core_log_msg_queues_server(struct server *server)
+{
+    struct conn *conn;
+    TAILQ_FOREACH(conn, &server->s_conn_q, conn_tqe)
+    {
+        _core_log_msg_queues_connection(conn);
+    }
+}
+
+void
+_core_log_msg_queues_connection(struct conn *conn)
+{
+    struct msg *msg, *nmsg;
+    struct msg_tqh msg_q;
+
+    msg = conn->rmsg;
+    if (msg != NULL) {
+        log_debug(LOG_DEBUG, "***** Message recv on sd %d", conn->sd);
+        _core_log_msg_queues_msg(msg);
+    }
+
+    msg = conn->smsg;
+    if (msg != NULL) {
+        log_debug(LOG_DEBUG, "***** Message send on sd %d", conn->sd);
+        _core_log_msg_queues_msg(msg);
+    }
+
+    msg_q = conn->imsg_q;
+    log_debug(LOG_DEBUG, "***** Message queue in on sd %d", conn->sd);
+    for (msg = TAILQ_FIRST(&msg_q); msg != NULL; msg = nmsg) {
+        nmsg = TAILQ_NEXT(msg, s_tqe);
+        _core_log_msg_queues_msg(msg);
+    }
+
+    msg_q = conn->omsg_q;
+    log_debug(LOG_DEBUG, "***** Message queue out on sd %d", conn->sd);
+    for (msg = TAILQ_FIRST(&msg_q); msg != NULL; msg = nmsg) {
+        nmsg = TAILQ_NEXT(msg, s_tqe);
+        _core_log_msg_queues_msg(msg);
+    }
+}
+
+void
+_core_log_msg_queues_msg(struct msg* msg) {
+    struct msg* pmsg = msg->peer;
+    struct string *msg_type;
+    msg_type = msg_type_string(msg->type);
+    log_debug(LOG_DEBUG, "****** Message id: %d, type: %.*s, request: %d",
+            msg->id, msg_type->len, msg_type->data, msg->request);
+    if (pmsg != NULL) {
+        msg_type = msg_type_string(pmsg->type);
+        log_debug(LOG_DEBUG, "******* Peer Message id: %d, type: %.*s,"
+                " request: %d",
+                pmsg->id, msg_type->len, msg_type->data, pmsg->request);
+    }
 }
 
 rstatus_t

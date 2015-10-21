@@ -53,7 +53,11 @@
 #define CONF_DEFAULT_SERVER_RETRY_TIMEOUT    30 * 1000      /* in msec */
 #define CONF_DEFAULT_SERVER_FAILURE_LIMIT    2
 #define CONF_DEFAULT_SERVER_CONNECTIONS      1
+#define CONF_DEFAULT_SERVER_TTL_MS           0              /* Never */
 #define CONF_DEFAULT_KETAMA_PORT             11211
+
+#define CONF_DEFAULT_BACKEND_TYPE            CONN_RIAK
+#define CONF_DEFAULT_BACKEND_MAX_RESEND      1
 
 struct conf_listen {
     struct string   pname;   /* listen: as "name:port" */
@@ -71,6 +75,7 @@ struct conf_server {
     int             weight;     /* weight */
     struct sockinfo info;       /* connect socket info */
     unsigned        valid:1;    /* valid? */
+    unsigned        backend:1;  /* backend? */
 };
 
 struct conf_pool {
@@ -91,6 +96,20 @@ struct conf_pool {
     int                server_retry_timeout;  /* server_retry_timeout: in msec */
     int                server_failure_limit;  /* server_failure_limit: */
     struct array       server;                /* servers: conf_server[] */
+    struct array       server_be;             /* backend servers: conf_server[] */
+    connection_type_t  backend_type;          /* The backend type */
+    int                backend_max_resend;    /* Maximum number of backend servers we will query */
+    int                backend_riak_r;        /* Riak r val */
+    int                backend_riak_pr;       /* Riak pr val */
+    int                backend_riak_w;        /* Riak w val */
+    int                backend_riak_pw;       /* Riak pw val */
+    int                backend_riak_n;        /* Riak n val */
+    int                backend_riak_basic_quorum;  /* Riak basic_quorum val */
+    int                backend_riak_sloppy_quorum; /* Riak sloppy_quorum val */
+    int                backend_riak_notfound_ok;   /* Riak notfound_ok */
+    int                backend_riak_deletedvclock; /* Riak deletedvclock */
+    int                backend_riak_timeout;       /* Riak timeout */
+    int64_t            server_ttl_ms;              /* TTL for keys in frontend servers, in msec */
     unsigned           valid:1;               /* valid? */
 };
 
@@ -123,11 +142,14 @@ struct command {
 char *conf_set_string(struct conf *cf, struct command *cmd, void *conf);
 char *conf_set_listen(struct conf *cf, struct command *cmd, void *conf);
 char *conf_add_server(struct conf *cf, struct command *cmd, void *conf);
+char *conf_add_server_be(struct conf *cf, struct command *cmd, void *conf);
 char *conf_set_num(struct conf *cf, struct command *cmd, void *conf);
 char *conf_set_bool(struct conf *cf, struct command *cmd, void *conf);
 char *conf_set_hash(struct conf *cf, struct command *cmd, void *conf);
 char *conf_set_distribution(struct conf *cf, struct command *cmd, void *conf);
 char *conf_set_hashtag(struct conf *cf, struct command *cmd, void *conf);
+char *conf_set_backend_type(struct conf *cf, struct command *cmd, void *conf);
+char *conf_set_server_ttl(struct conf *cf, struct command *cmd, void *conf);
 
 rstatus_t conf_server_each_transform(void *elem, void *data);
 rstatus_t conf_pool_each_transform(void *elem, void *data);

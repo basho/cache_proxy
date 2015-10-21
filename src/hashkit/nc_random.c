@@ -26,7 +26,7 @@
 #define RANDOM_POINTS_PER_SERVER    1
 
 rstatus_t
-random_update(struct server_pool *pool)
+random_update(struct servers *servers)
 {
     uint32_t nserver;             /* # server - live and dead */
     uint32_t nlive_server;        /* # live server */
@@ -38,36 +38,39 @@ random_update(struct server_pool *pool)
     uint32_t server_index;        /* server index */
     int64_t now;                  /* current timestamp in usec */
 
+    ASSERT(servers->owner != NULL );
+    const struct server_pool *pool = servers->owner;
+
     now = nc_usec_now();
     if (now < 0) {
         return NC_ERROR;
     }
 
-    nserver = array_n(&pool->server);
+    nserver = array_n(&servers->server_arr);
     nlive_server = 0;
-    pool->next_rebuild = 0LL;
+    servers->next_rebuild = 0LL;
 
     for (server_index = 0; server_index < nserver; server_index++) {
-        struct server *server = array_get(&pool->server, server_index);
+        struct server *server = array_get(&servers->server_arr, server_index);
 
         if (pool->auto_eject_hosts) {
             if (server->next_retry <= now) {
                 server->next_retry = 0LL;
                 nlive_server++;
-            } else if (pool->next_rebuild == 0LL ||
-                       server->next_retry < pool->next_rebuild) {
-                pool->next_rebuild = server->next_retry;
+            } else if (servers->next_rebuild == 0LL ||
+                       server->next_retry < servers->next_rebuild) {
+                servers->next_rebuild = server->next_retry;
             }
         } else {
             nlive_server++;
         }
     }
 
-    pool->nlive_server = nlive_server;
+    servers->nlive_server = nlive_server;
 
     if (nlive_server == 0) {
-        ASSERT(pool->continuum != NULL);
-        ASSERT(pool->ncontinuum != 0);
+        ASSERT(servers->continuum != NULL);
+        ASSERT(servers->ncontinuum != 0);
 
         log_debug(LOG_DEBUG, "no live servers for pool %"PRIu32" '%.*s'",
                   pool->idx, pool->name.len, pool->name.data);
@@ -85,20 +88,20 @@ random_update(struct server_pool *pool)
      * Allocate the continuum for the pool, the first time, and every time we
      * add a new server to the pool
      */
-    if (nlive_server > pool->nserver_continuum) {
+    if (nlive_server > servers->nserver_continuum) {
         struct continuum *continuum;
         uint32_t nserver_continuum = nlive_server + RANDOM_CONTINUUM_ADDITION;
         uint32_t ncontinuum = nserver_continuum *  RANDOM_POINTS_PER_SERVER;
 
-        continuum = nc_realloc(pool->continuum, sizeof(*continuum) * ncontinuum);
+        continuum = nc_realloc(servers->continuum, sizeof(*continuum) * ncontinuum);
         if (continuum == NULL) {
             return NC_ENOMEM;
         }
 
         srandom((uint32_t)time(NULL));
 
-        pool->continuum = continuum;
-        pool->nserver_continuum = nserver_continuum;
+        servers->continuum = continuum;
+        servers->nserver_continuum = nserver_continuum;
         /* pool->ncontinuum is initialized later as it could be <= ncontinuum */
     }
 
@@ -106,7 +109,7 @@ random_update(struct server_pool *pool)
     continuum_index = 0;
     pointer_counter = 0;
     for (server_index = 0; server_index < nserver; server_index++) {
-        struct server *server = array_get(&pool->server, server_index);
+        struct server *server = array_get(&servers->server_arr, server_index);
 
         if (pool->auto_eject_hosts && server->next_retry > now) {
             continue;
@@ -114,19 +117,19 @@ random_update(struct server_pool *pool)
 
         pointer_per_server = 1;
 
-        pool->continuum[continuum_index].index = server_index;
-        pool->continuum[continuum_index++].value = 0;
+        servers->continuum[continuum_index].index = server_index;
+        servers->continuum[continuum_index++].value = 0;
 
         pointer_counter += pointer_per_server;
     }
-    pool->ncontinuum = pointer_counter;
+    servers->ncontinuum = pointer_counter;
 
     log_debug(LOG_VERB, "updated pool %"PRIu32" '%.*s' with %"PRIu32" of "
               "%"PRIu32" servers live in %"PRIu32" slots and %"PRIu32" "
               "active points in %"PRIu32" slots", pool->idx,
               pool->name.len, pool->name.data, nlive_server, nserver,
-              pool->nserver_continuum, pool->ncontinuum,
-              (pool->nserver_continuum + continuum_addition) * points_per_server);
+              servers->nserver_continuum, servers->ncontinuum,
+              (servers->nserver_continuum + continuum_addition) * points_per_server);
 
     return NC_OK;
 

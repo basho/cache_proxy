@@ -20,6 +20,8 @@
 #include <nc_server.h>
 #include <proto/nc_proto.h>
 
+char* conf_add_server_(struct conf *cf, struct command *cmd, void *conf, bool backend);
+
 #define DEFINE_ACTION(_hash, _name) string(#_name),
 static struct string hash_strings[] = {
     HASH_CODEC( DEFINE_ACTION )
@@ -40,6 +42,24 @@ static struct string dist_strings[] = {
     null_string
 };
 #undef DEFINE_ACTION
+
+struct unit {
+    char* name;
+    double toms;
+};
+
+static struct unit units[] = {
+    {"ms",               1},
+    {"s",             1000},
+    {"sec",           1000},
+    {"min",        60*1000},
+    {"hr",       3600*1000},
+    {"hour",     3600*1000},
+    {"hours",    3600*1000},
+    {"day",   24*3600*1000},
+    {"days",  24*3600*1000},
+    { "",                0},
+};
 
 static struct command conf_commands[] = {
     { string("listen"),
@@ -102,9 +122,65 @@ static struct command conf_commands[] = {
       conf_set_num,
       offsetof(struct conf_pool, server_failure_limit) },
 
+    { string("server_ttl"),
+      conf_set_server_ttl,
+      offsetof(struct conf_pool, server_ttl_ms) },
+
     { string("servers"),
       conf_add_server,
       offsetof(struct conf_pool, server) },
+
+    { string("backends"),
+      conf_add_server_be,
+      offsetof(struct conf_pool, server_be) },
+
+    { string("backend_type"),
+      conf_set_backend_type,
+      offsetof(struct conf_pool, backend_type) },
+
+    { string("backend_max_resend"),
+      conf_set_num,
+      offsetof(struct conf_pool, backend_max_resend) },
+
+    { string("backend_riak_r"),
+      conf_set_num,
+      offsetof(struct conf_pool, backend_riak_r) },
+
+    { string("backend_riak_pr"),
+      conf_set_num,
+      offsetof(struct conf_pool, backend_riak_pr) },
+
+    { string("backend_riak_w"),
+      conf_set_num,
+      offsetof(struct conf_pool, backend_riak_w) },
+
+    { string("backend_riak_pw"),
+      conf_set_num,
+      offsetof(struct conf_pool, backend_riak_pw) },
+
+    { string("backend_riak_n"),
+      conf_set_num,
+      offsetof(struct conf_pool, backend_riak_n) },
+
+    { string("backend_riak_timeout"),
+      conf_set_num,
+      offsetof(struct conf_pool, backend_riak_timeout) },
+
+    { string("backend_riak_basic_quorum"),
+      conf_set_num,
+      offsetof(struct conf_pool, backend_riak_basic_quorum) },
+
+    { string("backend_riak_sloppy_quorum"),
+      conf_set_num,
+      offsetof(struct conf_pool, backend_riak_sloppy_quorum) },
+
+    { string("backend_riak_notfound_ok"),
+      conf_set_num,
+      offsetof(struct conf_pool, backend_riak_notfound_ok) },
+
+    { string("backend_riak_deletedvclock"),
+      conf_set_num,
+      offsetof(struct conf_pool, backend_riak_deletedvclock) },
 
     null_command
 };
@@ -120,6 +196,7 @@ conf_server_init(struct conf_server *cs)
     memset(&cs->info, 0, sizeof(cs->info));
 
     cs->valid = 0;
+    cs->backend = 0;
 
     log_debug(LOG_VVERB, "init conf server %p", cs);
 }
@@ -163,6 +240,8 @@ conf_server_each_transform(void *elem, void *data)
     s->next_retry = 0LL;
     s->failure_count = 0;
 
+    s->backend = cs->backend;
+
     log_debug(LOG_VERB, "transform to server %"PRIu32" '%.*s'",
               s->idx, s->pname.len, s->pname.data);
 
@@ -199,6 +278,20 @@ conf_pool_init(struct conf_pool *cp, struct string *name)
     cp->server_connections = CONF_UNSET_NUM;
     cp->server_retry_timeout = CONF_UNSET_NUM;
     cp->server_failure_limit = CONF_UNSET_NUM;
+    cp->server_ttl_ms = CONF_UNSET_NUM;
+
+    cp->backend_type = CONN_UNKNOWN;
+    cp->backend_max_resend = CONF_UNSET_NUM;
+    cp->backend_riak_r = CONF_UNSET_NUM;
+    cp->backend_riak_pr = CONF_UNSET_NUM;
+    cp->backend_riak_w = CONF_UNSET_NUM;
+    cp->backend_riak_pw = CONF_UNSET_NUM;
+    cp->backend_riak_n = CONF_UNSET_NUM;
+    cp->backend_riak_basic_quorum = CONF_UNSET_NUM;
+    cp->backend_riak_sloppy_quorum = CONF_UNSET_NUM;
+    cp->backend_riak_notfound_ok = CONF_UNSET_NUM;
+    cp->backend_riak_deletedvclock = CONF_UNSET_NUM;
+    cp->backend_riak_timeout = CONF_UNSET_NUM;
 
     array_null(&cp->server);
 
@@ -213,6 +306,14 @@ conf_pool_init(struct conf_pool *cp, struct string *name)
                         sizeof(struct conf_server));
     if (status != NC_OK) {
         string_deinit(&cp->name);
+        return status;
+    }
+
+    status = array_init(&cp->server_be, CONF_DEFAULT_SERVERS,
+                        sizeof(struct conf_server));
+    if (status != NC_OK) {
+        string_deinit(&cp->name);
+        array_deinit(&cp->server);
         return status;
     }
 
@@ -236,7 +337,13 @@ conf_pool_deinit(struct conf_pool *cp)
     while (array_n(&cp->server) != 0) {
         conf_server_deinit(array_pop(&cp->server));
     }
+
+    while (array_n(&cp->server_be) != 0) {
+        conf_server_deinit(array_pop(&cp->server_be));
+    }
+
     array_deinit(&cp->server);
+    array_deinit(&cp->server_be);
 
     log_debug(LOG_VVERB, "deinit conf pool %p", cp);
 }
@@ -261,12 +368,21 @@ conf_pool_each_transform(void *elem, void *data)
     sp->nc_conn_q = 0;
     TAILQ_INIT(&sp->c_conn_q);
 
-    array_null(&sp->server);
-    sp->ncontinuum = 0;
-    sp->nserver_continuum = 0;
-    sp->continuum = NULL;
-    sp->nlive_server = 0;
-    sp->next_rebuild = 0LL;
+    array_null(&sp->frontends.server_arr);
+    sp->frontends.owner = sp;
+    sp->frontends.ncontinuum = 0;
+    sp->frontends.nserver_continuum = 0;
+    sp->frontends.continuum = NULL;
+    sp->frontends.nlive_server = 0;
+    sp->frontends.next_rebuild = 0LL;
+
+    array_null(&sp->backends.server_arr);
+    sp->backends.owner = sp;
+    sp->backends.ncontinuum = 0;
+    sp->backends.nserver_continuum = 0;
+    sp->backends.continuum = NULL;
+    sp->backends.nlive_server = 0;
+    sp->backends.next_rebuild = 0LL;
 
     sp->name = cp->name;
     sp->addrstr = cp->listen.pname;
@@ -293,12 +409,41 @@ conf_pool_each_transform(void *elem, void *data)
     sp->server_connections = (uint32_t)cp->server_connections;
     sp->server_retry_timeout = (int64_t)cp->server_retry_timeout * 1000LL;
     sp->server_failure_limit = (uint32_t)cp->server_failure_limit;
+    sp->server_ttl_ms = (uint32_t)cp->server_ttl_ms;
     sp->auto_eject_hosts = cp->auto_eject_hosts ? 1 : 0;
     sp->preconnect = cp->preconnect ? 1 : 0;
 
-    status = server_init(&sp->server, &cp->server, sp);
+    status = server_init(&sp->frontends.server_arr, &cp->server, sp);
     if (status != NC_OK) {
         return status;
+    }
+
+    /*
+    * Check the number of backend servers before initialization.
+    * Unlike frontend servers, we allow this to be zero, since we
+    * don't require backing servers at all.
+    */
+
+    sp->backend_opt.type = cp->backend_type;
+    sp->backend_opt.max_resend = cp->backend_max_resend;
+    sp->backend_opt.riak_r = cp->backend_riak_r;
+    sp->backend_opt.riak_pr = cp->backend_riak_pr;
+    sp->backend_opt.riak_w = cp->backend_riak_w;
+    sp->backend_opt.riak_pw = cp->backend_riak_pw;
+    sp->backend_opt.riak_n = cp->backend_riak_n;
+    sp->backend_opt.riak_basic_quorum = cp->backend_riak_basic_quorum;
+    sp->backend_opt.riak_sloppy_quorum = cp->backend_riak_sloppy_quorum;
+    sp->backend_opt.riak_notfound_ok = cp->backend_riak_notfound_ok;
+    sp->backend_opt.riak_deletedvclock = cp->backend_riak_deletedvclock;
+    sp->backend_opt.riak_timeout = cp->backend_riak_timeout;
+
+    uint32_t nbackend_server = array_n(&cp->server_be);
+
+    if (nbackend_server > 0) {
+      status = server_init(&sp->backends.server_arr, &cp->server_be, sp);
+      if (status != NC_OK) {
+        return status;
+      }
     }
 
     log_debug(LOG_VERB, "transform to pool %"PRIu32" '%.*s'", sp->idx,
@@ -310,7 +455,7 @@ conf_pool_each_transform(void *elem, void *data)
 static void
 conf_dump(struct conf *cf)
 {
-    uint32_t i, j, npool, nserver;
+    uint32_t i, j, npool, nserver, nbackend_server;
     struct conf_pool *cp;
     struct string *s;
 
@@ -351,6 +496,14 @@ conf_dump(struct conf *cf)
 
         for (j = 0; j < nserver; j++) {
             s = array_get(&cp->server, j);
+            log_debug(LOG_VVERB, "    %.*s", s->len, s->data);
+        }
+
+        nbackend_server = array_n(&cp->server_be);
+        log_debug(LOG_VVERB, "  backend servers: %"PRIu32"", nbackend_server);
+
+        for (j = 0; j < nbackend_server; j++) {
+            s = array_get(&cp->server_be, j);
             log_debug(LOG_VVERB, "    %.*s", s->len, s->data);
         }
     }
@@ -493,7 +646,7 @@ conf_handler(struct conf *cf, void *data)
 
     if (array_n(&cf->arg) == 1) {
         value = array_top(&cf->arg);
-        log_debug(LOG_VVERB, "conf handler on '%.*s'", value->len, value->data);
+        log_debug(LOG_VVERB, "(1) conf handler on '%.*s'", value->len, value->data);
         return conf_pool_init(data, value);
     }
 
@@ -501,11 +654,11 @@ conf_handler(struct conf *cf, void *data)
     value = array_get(&cf->arg, narg - 1);
     key = array_get(&cf->arg, narg - 2);
 
-    log_debug(LOG_VVERB, "conf handler on %.*s: %.*s", key->len, key->data,
+    log_debug(LOG_VVERB, "(2) conf handler on %.*s: %.*s", key->len, key->data,
               value->len, value->data);
 
     for (cmd = conf_commands; cmd->name.len != 0; cmd++) {
-        char *rv;
+        char *rv = CONF_OK;
 
         if (string_compare(key, &cmd->name) != 0) {
             continue;
@@ -963,9 +1116,9 @@ static rstatus_t
 conf_validate_structure(struct conf *cf)
 {
     rstatus_t status;
-    int type, depth;
+    int type, depth, seq;
     uint32_t i, count[CONF_MAX_DEPTH + 1];
-    bool done, error, seq;
+    bool done, error;
 
     status = conf_yaml_init(cf);
     if (status != NC_OK) {
@@ -1052,9 +1205,9 @@ conf_validate_structure(struct conf *cf)
             break;
 
         case YAML_SEQUENCE_START_EVENT:
-            if (seq) {
+            if (seq > 1) {
                 error = true;
-                log_error("conf: '%s' has more than one sequence directive",
+                log_error("conf: '%s' has more than two sequence directives",
                           cf->fname);
             } else if (depth != CONF_MAX_DEPTH) {
                 error = true;
@@ -1065,7 +1218,7 @@ conf_validate_structure(struct conf *cf)
                 log_error("conf: '%s' has invalid \"key:value\" at depth %d",
                           cf->fname, depth);
             }
-            seq = true;
+            seq++;
             break;
 
         case YAML_SEQUENCE_END_EVENT:
@@ -1255,6 +1408,20 @@ conf_validate_pool(struct conf *cf, struct conf_pool *cp)
         cp->server_failure_limit = CONF_DEFAULT_SERVER_FAILURE_LIMIT;
     }
 
+    if (cp->server_ttl_ms == CONF_UNSET_NUM) {
+        cp->server_ttl_ms = CONF_DEFAULT_SERVER_TTL_MS;
+    }
+
+    if (cp->backend_type == CONN_UNKNOWN) {
+        cp->backend_type = CONF_DEFAULT_BACKEND_TYPE;
+    }
+
+    if (cp->backend_max_resend == CONF_UNSET_NUM) {
+        cp->backend_max_resend = CONF_DEFAULT_BACKEND_MAX_RESEND;
+    } else if (cp->backend_max_resend == 0) {
+        cp->backend_max_resend = 1;
+    }
+
     status = conf_validate_server(cf, cp);
     if (status != NC_OK) {
         return status;
@@ -1442,8 +1609,6 @@ conf_set_listen(struct conf *cf, struct command *cmd, void *conf)
 
     if (value->data[0] == '/') {
         uint8_t *q, *start, *perm;
-        uint32_t permlen;
-
 
         /* parse "socket_path permissions" from the end */
         p = value->data + value->len -1;
@@ -1455,7 +1620,6 @@ conf_set_listen(struct conf *cf, struct command *cmd, void *conf)
             namelen = value->len;
         } else {
             perm = q + 1;
-            permlen = (uint32_t)(p - perm + 1);
 
             p = q - 1;
             name = start;
@@ -1509,7 +1673,7 @@ conf_set_listen(struct conf *cf, struct command *cmd, void *conf)
 }
 
 char *
-conf_add_server(struct conf *cf, struct command *cmd, void *conf)
+conf_add_server_(struct conf *cf, struct command *cmd, void *conf, bool backend)
 {
     rstatus_t status;
     struct array *a;
@@ -1531,6 +1695,8 @@ conf_add_server(struct conf *cf, struct command *cmd, void *conf)
     }
 
     conf_server_init(field);
+
+    field->backend = backend;
 
     value = array_top(&cf->arg);
 
@@ -1650,6 +1816,67 @@ conf_add_server(struct conf *cf, struct command *cmd, void *conf)
     return CONF_OK;
 }
 
+char * 
+conf_add_server(struct conf *cf, struct command *cmd, void *conf)
+{
+    return conf_add_server_(cf, cmd, conf, false);
+}
+
+char *
+conf_add_server_be(struct conf *cf, struct command *cmd, void *conf)
+{
+    return conf_add_server_(cf, cmd, conf, true);
+}
+
+char* 
+conf_set_server_ttl(struct conf *cf, struct command *cmd, void *conf)
+{
+    uint8_t *p;
+    int64_t *np;
+
+    struct string *value;
+
+    p = conf;
+    np = (int64_t *)(p + cmd->offset);
+
+    if (*np != CONF_UNSET_NUM) {
+        return "is a duplicate";
+    }
+
+    value = array_top(&cf->arg);
+
+    char* val = (char*)value->data;
+    char* ptr = 0;
+
+    double dval = strtod(val, &ptr);
+
+    if (ptr == val) {
+        return CONF_ERROR;
+    }
+
+    uint32_t unit_len = 0;
+    char unitstr[value->len+1];
+
+    while (*ptr != '\0') {
+        if (isalpha(*ptr) && !isspace(*ptr))
+            unitstr[unit_len++] = *ptr;
+        ptr++;
+    }
+    unitstr[unit_len] = '\0';
+    
+    struct unit* unitptr=0;
+    for (unitptr = units; strlen(unitptr->name) != 0; unitptr++) {
+        if (strlen(unitptr->name) == strlen(unitstr)) {
+            if (strcasecmp(unitptr->name, unitstr) == 0) {
+                *np = (int64_t)(dval * unitptr->toms);
+                return CONF_OK;
+            }
+        }
+    }
+
+    return (void*)"has invalid units";
+}
+
 char *
 conf_set_num(struct conf *cf, struct command *cmd, void *conf)
 {
@@ -1726,7 +1953,7 @@ conf_set_hash(struct conf *cf, struct command *cmd, void *conf)
             continue;
         }
 
-        *hp = hash - hash_strings;
+        *hp = (hash_type_t)(hash - hash_strings);
 
         return CONF_OK;
     }
@@ -1755,7 +1982,7 @@ conf_set_distribution(struct conf *cf, struct command *cmd, void *conf)
             continue;
         }
 
-        *dp = dist - dist_strings;
+        *dp = (dist_type_t)(dist - dist_strings);
 
         return CONF_OK;
     }
@@ -1789,4 +2016,30 @@ conf_set_hashtag(struct conf *cf, struct command *cmd, void *conf)
     }
 
     return CONF_OK;
+}
+
+char *
+conf_set_backend_type(struct conf *cf, struct command *cmd, void *conf)
+{
+    uint8_t *p;
+    connection_type_t* bp;
+    struct string *value, *backend;
+
+    p = conf;
+    bp = (connection_type_t *)(p + cmd->offset);
+
+    value = array_top(&cf->arg);
+
+    for (backend = connection_strings; backend->len != 0; backend++)
+    {
+        if (string_compare(value, backend) != 0) {
+            continue;
+        }
+
+        *bp = (connection_type_t)(backend - connection_strings);
+
+        return CONF_OK;
+    }
+
+    return "is not a valid backend type";
 }

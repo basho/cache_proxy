@@ -187,7 +187,9 @@ array_each(struct array *a, array_each_t func, void *data)
 {
     uint32_t i, nelem;
 
-    ASSERT(array_n(a) != 0);
+    if (array_n(a) == 0) {
+        return NC_OK;
+    }
     ASSERT(func != NULL);
 
     for (i = 0, nelem = array_n(a); i < nelem; i++) {

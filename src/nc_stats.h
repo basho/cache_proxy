@@ -78,6 +78,7 @@ struct stats_pool {
     struct string name;   /* pool name (ref) */
     struct array  metric; /* stats_metric[] for pool codec */
     struct array  server; /* stats_server[] */
+    struct array  server_be; /* stats_server_be[] */
 };
 
 struct stats_buffer {

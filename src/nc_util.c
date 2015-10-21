@@ -368,8 +368,8 @@ _scnprintf(char *buf, size_t size, const char *fmt, ...)
 ssize_t
 _nc_sendn(int sd, const void *vptr, size_t n)
 {
-    size_t nleft;
-    ssize_t	nsend;
+    size_t  nleft;
+    ssize_t nsend;
     const char *ptr;
 
     ptr = vptr;
@@ -399,13 +399,13 @@ _nc_sendn(int sd, const void *vptr, size_t n)
 ssize_t
 _nc_recvn(int sd, void *vptr, size_t n)
 {
-	size_t nleft;
-	ssize_t	nrecv;
-	char *ptr;
+    size_t  nleft;
+    ssize_t nrecv;
+    char *ptr;
 
-	ptr = vptr;
-	nleft = n;
-	while (nleft > 0) {
+    ptr = vptr;
+    nleft = n;
+    while (nleft > 0) {
         nrecv = recv(sd, ptr, nleft, 0);
         if (nrecv < 0) {
             if (errno == EINTR) {
@@ -633,4 +633,40 @@ nc_unresolve_desc(int sd)
     }
 
     return nc_unresolve_addr(addr, addrlen);
+}
+
+/*
+ * Return 10 based number of chars for uint32_t
+ */
+uint32_t
+ndig(uint32_t val)
+{
+    if (val >= 10000) {
+        if (val >= 10000000) {
+            if (val >= 100000000) {
+                if (val >= 1000000000) {
+                    return 10;
+                }
+                return 9;
+            }
+            return 8;
+        }
+        if (val >= 100000) {
+            if (val >= 1000000) {
+                return 7;
+            }
+            return 6;
+        }
+        return 5;
+    }
+    if (val >= 100) {
+        if (val >= 1000) {
+            return 4;
+        }
+        return 3;
+    }
+    if (val >= 10) {
+        return 2;
+    }
+    return 1;
 }

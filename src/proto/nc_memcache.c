@@ -1271,7 +1271,7 @@ memcache_fragment_retrieval(struct msg *r, uint32_t ncontinuum,
         uint32_t idx = msg_backend_idx(r, kpos->start, kpos->end - kpos->start);
 
         if (sub_msgs[idx] == NULL) {
-            sub_msgs[idx] = msg_get(r->owner, r->request, r->redis);
+            sub_msgs[idx] = msg_get(r->owner, r->request);
             if (sub_msgs[idx] == NULL) {
                 nc_free(sub_msgs);
                 return NC_ENOMEM;
@@ -1549,3 +1549,11 @@ memcache_reply(struct msg *r)
     return NC_OK;
 }
 
+/**.......................................................................
+ * Repack a message -- this is a no-op for memcache
+ */
+rstatus_t
+memcache_repack(struct msg* r)
+{
+    return NC_OK;
+}

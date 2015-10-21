@@ -1,8 +1,13 @@
 # Define the package version numbers and the bug reporting address
-m4_define([NC_MAJOR], 0)
-m4_define([NC_MINOR], 4)
+# NOTE: when pumping the version, there are gotchas (should investigate/remove)
+# the tests include if nc.version() < VERSION+1, short circuit
+# these functions should likely be removed instead as tracking down and killing
+# future versions is far less likely a need than the hassle this likely code
+# to configure.ac discrepancy creates when pumping versions.
+m4_define([NC_MAJOR], 1)
+m4_define([NC_MINOR], 0)
 m4_define([NC_PATCH], 0)
-m4_define([NC_BUGS], [manj@cs.stanford.edu])
+m4_define([NC_BUGS], [riak-users@lists.basho.com])
 
 # Initialize autoconf
 AC_PREREQ([2.64])
@@ -195,6 +200,8 @@ AS_IF([test "x$disable_stats" = xyes],
   [],
   [AC_DEFINE([HAVE_STATS], [1], [Define to 1 if stats is not disabled])])
 AC_MSG_RESULT($disable_stats)
+
+PKG_CHECK_MODULES([PROTOBUF], [libprotobuf-c])
 
 # Untar the yaml-0.1.4 in contrib/ before config.status is rerun
 AC_CONFIG_COMMANDS_PRE([tar xvfz contrib/yaml-0.1.4.tar.gz -C contrib])

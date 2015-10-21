@@ -292,6 +292,7 @@ event_wait(struct event_base *evb, int timeout)
     }
 
     NOT_REACHED();
+    return -1;
 }
 
 void

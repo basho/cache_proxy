@@ -48,10 +48,10 @@
  * type (uintmax_t) in ascii, including the null terminator '\0'
  *
  * From stdint.h, we have:
- * # define UINT8_MAX	(255)
- * # define UINT16_MAX	(65535)
- * # define UINT32_MAX	(4294967295U)
- * # define UINT64_MAX	(__UINT64_C(18446744073709551615))
+ * # define UINT8_MAX   (255)
+ * # define UINT16_MAX  (65535)
+ * # define UINT32_MAX  (4294967295U)
+ * # define UINT64_MAX  (__UINT64_C(18446744073709551615))
  */
 #define NC_UINT8_MAXLEN     (3 + 1)
 #define NC_UINT16_MAXLEN    (5 + 1)
@@ -163,14 +163,28 @@ ssize_t _nc_recvn(int sd, void *vptr, size_t n);
     }                                           \
 } while (0)
 
+#define ASSERT_(_x, ...) do {                   \
+    if (!(_x)) {                                \
+        log_debug(LOG_ALERT, __VA_ARGS__);      \
+        nc_assert(#_x, __FILE__, __LINE__, 1);  \
+    }                                           \
+} while (0)
+
 #define NOT_REACHED() ASSERT(0)
 
 #elif NC_ASSERT_LOG
 
 #define ASSERT(_x) do {                         \
     if (!(_x)) {                                \
+        log_debug(LOG_ALERT, __VA_ARGS__);      \
         nc_assert(#_x, __FILE__, __LINE__, 0);  \
     }                                           \
+} while (0)
+
+#define ASSERT_(_x, msg) do {                         \
+    if (!(_x)) {                                      \
+        nc_assert(msg, __FILE__, __LINE__, 0);        \
+    }                                                 \
 } while (0)
 
 #define NOT_REACHED() ASSERT(0)
@@ -178,6 +192,7 @@ ssize_t _nc_recvn(int sd, void *vptr, size_t n);
 #else
 
 #define ASSERT(_x)
+#define ASSERT_(_x, ...)
 
 #define NOT_REACHED()
 
@@ -211,5 +226,6 @@ int nc_resolve(struct string *name, int port, struct sockinfo *si);
 char *nc_unresolve_addr(struct sockaddr *addr, socklen_t addrlen);
 char *nc_unresolve_peer_desc(int sd);
 char *nc_unresolve_desc(int sd);
+uint32_t ndig(uint32_t val);
 
 #endif

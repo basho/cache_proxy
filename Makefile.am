@@ -4,6 +4,12 @@ ACLOCAL_AMFLAGS = -I m4
 
 SUBDIRS = contrib src
 
+unittests-nutcracker:
+	cp src/nutcracker tests/_binaries
+	cd tests && ./nosetests.sh $(NOSE_TESTS)
+
+test : unittests-nutcracker
+
 dist_man_MANS = man/nutcracker.8
 
 EXTRA_DIST = README.md NOTICE LICENSE ChangeLog conf scripts notes
