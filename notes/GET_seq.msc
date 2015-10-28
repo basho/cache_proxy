@@ -1,0 +1,21 @@
+# Cache Proxy GET
+msc {
+    Client,CacheProxy,Redis,RiakKV;
+
+    Client -> CacheProxy [ label = "1. get" ];
+    CacheProxy -> Redis [ label = "2. get" ];
+    --- [ label = "Cache Hit" ];
+    CacheProxy << Redis [ label = "3.a. Object" ];
+    Client << CacheProxy [ label = "4.a. Object" ];
+    --- [ label = "Cache Miss, Persistent Store Hit" ];
+    CacheProxy << Redis [ label = "3.b. MISS" ];
+    CacheProxy -> RiakKV [ label = "4.b. get" ];
+    CacheProxy << RiakKV [ label = "5.b. Object" ];
+    CacheProxy -> Redis [ label = "6.b. set w/ TTL" ];
+    Client << CacheProxy [ label = "7.b. Object" ];
+    --- [ label = "Cache Miss, Persistent Store Miss" ];
+    CacheProxy << Redis [ label = "3.c. MISS" ];
+    CacheProxy -> RiakKV [ label = "4.c. get" ];
+    CacheProxy << RiakKV [ label = "5.c MISS" ];
+    Client << CacheProxy [ label = "6.c. MISS" ];
+}

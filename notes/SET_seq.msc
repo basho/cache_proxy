@@ -1,0 +1,19 @@
+# Cache Proxy GET
+msc {
+    Client,CacheProxy,Redis,RiakKV;
+
+    Client -> CacheProxy [ label = "1. set" ];
+    CacheProxy -> RiakKV [ label = "2. get (for vclock)" ];
+    --- [ label = "Update" ];
+    CacheProxy << RiakKV [ label = "3.a. Object" ];
+    CacheProxy -> CacheProxy [ label = "4.a. set vclock" ];
+    --- [ label = "Create" ];
+    CacheProxy << RiakKV [ label = "3.b. MISS" ];
+    CacheProxy -> CacheProxy [ label = "4.b. initialize vclock" ];
+    --- [ label = "Create or Update" ];
+    CacheProxy -> RiakKV [ label = "5. put (w/ vclock)" ];
+    CacheProxy << RiakKV [ label = "6. OK" ];
+    CacheProxy -> Redis [ label = "7. pexpire" ];
+    CacheProxy << Redis [ label = "8. OK" ];
+    Client << CacheProxy [ label = "9. OK" ];
+}

@@ -1,0 +1,11 @@
+# Cache Proxy GET
+msc {
+    Client,CacheProxy,Redis,RiakKV;
+
+    Client -> CacheProxy [ label = "1. del" ];
+    CacheProxy -> RiakKV [ label = "2. del" ];
+    CacheProxy << RiakKV [ label = "3. OK" ];
+    CacheProxy -> Redis [ label = "4. pexpire" ];
+    CacheProxy << Redis [ label = "5. OK" ];
+    Client << CacheProxy [ label = "6. 1 (count of keys from 1)" ];
+}

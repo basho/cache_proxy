@@ -1,0 +1,58 @@
+# Cache Proxy GET
+msc {
+    Client,CacheProxy,Redis,RiakKV;
+
+    --- [ label = "Create" ];
+    Client -> CacheProxy [ label = "1. set" ];
+    CacheProxy -> RiakKV [ label = "2. get (for vclock)" ];
+    CacheProxy << RiakKV [ label = "3. MISS" ];
+    CacheProxy -> CacheProxy [ label = "4. initialize vclock" ];
+    CacheProxy -> RiakKV [ label = "5. put (w/ vclock)" ];
+    CacheProxy << RiakKV [ label = "6. OK" ];
+    CacheProxy -> Redis [ label = "7. pexpire" ];
+    CacheProxy << Redis [ label = "8. OK" ];
+    Client << CacheProxy [ label = "9. OK" ];
+
+    --- [ label = "Read" ];
+    --- [ label = "Cache Miss, Persistent Store Hit" ];
+    Client -> CacheProxy [ label = "1. get" ];
+    CacheProxy -> Redis [ label = "2. get" ];
+    CacheProxy << Redis [ label = "3.b. MISS" ];
+    CacheProxy -> RiakKV [ label = "4.b. get" ];
+    CacheProxy << RiakKV [ label = "5.b. Object" ];
+    CacheProxy -> Redis [ label = "6.b. set w/ TTL" ];
+    Client << CacheProxy [ label = "7.b. Object" ];
+    --- [ label = "Cache Hit" ];
+    Client -> CacheProxy [ label = "1. get" ];
+    CacheProxy -> Redis [ label = "2. get" ];
+    CacheProxy << Redis [ label = "3.a. Object" ];
+    Client << CacheProxy [ label = "4.a. Object" ];
+
+    --- [ label = "Update" ];
+    Client -> CacheProxy [ label = "1. set" ];
+    CacheProxy -> RiakKV [ label = "2. get (for vclock)" ];
+    CacheProxy << RiakKV [ label = "3. Object" ];
+    CacheProxy -> CacheProxy [ label = "4. set vclock" ];
+    CacheProxy -> RiakKV [ label = "5. put (w/ vclock)" ];
+    CacheProxy << RiakKV [ label = "6. OK" ];
+    CacheProxy -> Redis [ label = "7. pexpire" ];
+    CacheProxy << Redis [ label = "8. OK" ];
+    Client << CacheProxy [ label = "9. OK" ];
+
+    --- [ label = "Delete" ];
+    Client -> CacheProxy [ label = "1. del" ];
+    CacheProxy -> RiakKV [ label = "2. del" ];
+    CacheProxy << RiakKV [ label = "3. OK" ];
+    CacheProxy -> Redis [ label = "4. pexpire" ];
+    CacheProxy << Redis [ label = "5. OK" ];
+    Client << CacheProxy [ label = "6. 1 (count of keys from 1)" ];
+
+    --- [ label = "Read" ];
+    --- [ label = "Cache Miss, Persistent Store Miss" ];
+    Client -> CacheProxy [ label = "1. get" ];
+    CacheProxy -> Redis [ label = "2. get" ];
+    CacheProxy << Redis [ label = "3.c. MISS" ];
+    CacheProxy -> RiakKV [ label = "4.c. get" ];
+    CacheProxy << RiakKV [ label = "5.c MISS" ];
+    Client << CacheProxy [ label = "6.c. MISS" ];
+}
