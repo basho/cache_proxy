@@ -192,7 +192,7 @@ ketama_update(struct servers *servers)
     }
 
     servers->ncontinuum = pointer_counter;
-    qsort(servers->continuum, servers->ncontinuum, sizeof(servers->ncontinuum),
+    qsort(servers->continuum, servers->ncontinuum, sizeof(servers->continuum),
           ketama_item_cmp);
 
     for (pointer_index = 0;
